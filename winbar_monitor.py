@@ -221,6 +221,11 @@ def _percent(value: Any) -> str:
     return "N/A" if number is None else f"{number:.0f}%"
 
 
+def _menu_icon(color: str) -> str:
+    """Render an icon-only SwiftBar title and hide it from the dropdown."""
+    return f"\u200b | sfimage=desktopcomputer sfcolor={color} dropdown=false"
+
+
 def _uptime(last_boot: Any, now: float | None = None) -> str:
     if not last_boot:
         return "N/A"
@@ -251,8 +256,9 @@ def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = 
     temperature_text = f"{temperature:.0f}°C" if temperature is not None else "N/A"
     power_text = f"{power_draw:.0f} W" if power_draw is not None else "N/A"
     state = "🟡 缓存" if stale else "🟢 在线"
-    header = f"{state} · GPU {gpu_util} · CPU {cpu}"
-    lines = [header, "---", f"🖥️ Windows · {metrics.get('hostname', 'y9000p')}",
+    icon_color = "yellow" if stale else "green"
+    summary = f"{state} · GPU {gpu_util} · CPU {cpu}"
+    lines = [_menu_icon(icon_color), "---", summary, "---", f"🖥️ Windows · {metrics.get('hostname', 'y9000p')}",
              f"CPU 占用 · {cpu}", f"内存 · {_fmt_bytes(metrics.get('memory_total_bytes') - metrics.get('memory_free_bytes')) if metrics.get('memory_total_bytes') is not None and metrics.get('memory_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('memory_total_bytes'))}",
              f"C盘 · {_fmt_bytes(metrics.get('disk_total_bytes') - metrics.get('disk_free_bytes')) if metrics.get('disk_total_bytes') is not None and metrics.get('disk_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('disk_total_bytes'))}",
              f"网络 · ↓ {_fmt_rate(metrics.get('network_rx_bps'))} · ↑ {_fmt_rate(metrics.get('network_tx_bps'))}",
@@ -287,7 +293,7 @@ def main() -> int:
         if cached:
             print(render(normalize_metrics(cached), stale=True, error=f"连接失败：{exc}", collected_at=cached_at))
         else:
-            print(f"🔴 离线 · Windows\n---\n⚠️ {exc}\n---\n🔄 手动刷新 | refresh=true")
+            print(f"{_menu_icon('red')}\n---\n🔴 离线 · Windows\n---\n⚠️ {exc}\n---\n🔄 手动刷新 | refresh=true")
     return 0
 
 
