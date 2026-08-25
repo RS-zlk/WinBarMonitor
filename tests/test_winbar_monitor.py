@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -73,6 +74,28 @@ class RuntimeCompatibilityTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+    def test_install_keeps_support_module_hidden(self):
+        project_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as folder:
+            env = dict(os.environ)
+            env["SWIFTBAR_PLUGIN_DIR"] = folder
+            env["WINBAR_REFRESH_SECONDS"] = "7"
+            subprocess.run(
+                [str(project_root / "install.sh")],
+                cwd=project_root,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            plugin = Path(folder) / "winbar.7s.py"
+            support = Path(folder) / ".winbar_lib" / "winbar_monitor.py"
+            self.assertTrue(plugin.exists())
+            self.assertTrue(os.access(plugin, os.X_OK))
+            self.assertTrue(support.exists())
+            self.assertFalse(os.access(support, os.X_OK))
+            self.assertFalse((Path(folder) / "winbar_monitor.py").exists())
 
 
 if __name__ == "__main__":
