@@ -1,5 +1,7 @@
 # WinBarMonitor
 
+[![CI](https://github.com/RS-zlk/WinBarMonitor/actions/workflows/ci.yml/badge.svg)](https://github.com/RS-zlk/WinBarMonitor/actions/workflows/ci.yml)
+
 WinBarMonitor is a dependency-free [SwiftBar](https://swiftbar.app/) plugin
 that puts live metrics from a remote Windows PC in the macOS menu bar. It
 shows CPU, memory, C: drive, network, uptime, top processes, and optional
@@ -15,6 +17,9 @@ and an optional `nvidia-smi` query.
   when the hostname is unavailable.
 - Green online, yellow cached, and red offline custom PNG icons.
 - Last successful metrics are cached locally for short offline visibility.
+- Successful samples are retained in a local SQLite database for 30 days by
+  default, with a self-contained browser dashboard.
+- Machine-specific settings live in a Git-ignored `.winbar.env` file.
 - No third-party Python packages and no service hosted by this project.
 - Handles no NVIDIA GPU, multiple GPUs, `N/A` values, and slow SSH links.
 
@@ -31,24 +36,30 @@ standard library, POSIX shell utilities, macOS `ssh`, and Windows built-ins.
 ## Installation
 
 1. Install and launch SwiftBar, then choose its plugin folder.
-2. Create an SSH config alias named `windows-monitor` (or set
-   `WINBAR_SSH_ALIAS`).
+2. Create a machine-local configuration file:
+
+   ```sh
+   cp .winbar.env.example .winbar.env
+   ```
+
+   Edit `.winbar.env` and set `WINBAR_SSH_ALIAS` to the SSH config alias for
+   the Windows PC. This local file is ignored by Git.
 3. Verify a non-interactive connection:
 
    ```sh
-   ssh windows-monitor
+   ssh windows-monitor  # Replace with the alias configured in .winbar.env.
    ```
 
 4. Install the plugin:
 
    ```sh
    ./install.sh
-   # Optional: choose the refresh interval and plugin directory.
-   WINBAR_REFRESH_SECONDS=10 SWIFTBAR_PLUGIN_DIR="/path/to/plugins" ./install.sh
    ```
 
 Refresh SwiftBar. The generated plugin filename controls SwiftBar's refresh
-interval; opening the menu also supports a manual refresh action.
+interval. The installer copies the local configuration into SwiftBar with
+owner-only permissions. Opening the menu is immediate and does not trigger a
+new SSH request; use the manual refresh action when needed.
 
 ## Windows OpenSSH and keys
 
@@ -70,9 +81,15 @@ Use a private network or VPN, restrict firewall sources, and keep SSH
 `BatchMode` authentication enabled. Never commit private keys, passwords,
 tokens, or real host addresses.
 
-## Configuration
+## Local configuration
 
-All settings are optional environment variables:
+`.winbar.env` uses shell-style `KEY=VALUE` lines. Keep real host aliases and
+machine-specific paths in that file, never in tracked source files. The
+installer reads the file to determine the plugin location and refresh
+interval, then copies it beside the installed support module. Runtime
+environment variables override values from the file.
+
+All settings are optional:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -80,17 +97,35 @@ All settings are optional environment variables:
 | `WINBAR_REFRESH_SECONDS` | `30` | Positive plugin refresh interval |
 | `WINBAR_SSH_TIMEOUT` | `15` | Positive total collection timeout |
 | `WINBAR_CACHE_PATH` | `~/.cache/winbar-monitor/cache.json` | Local cache file |
+| `WINBAR_HISTORY_PATH` | `~/.local/share/winbar-monitor/history.sqlite3` | Local history database |
+| `WINBAR_REPORT_PATH` | `~/.local/share/winbar-monitor/history.html` | Generated dashboard |
+| `WINBAR_RETENTION_DAYS` | `30` | Raw sample retention period |
+| `SWIFTBAR_PLUGIN_DIR` | SwiftBar's standard plugin folder | Installation location |
 
-Values for refresh and timeout are clamped to a minimum of one second. The
-cache is written atomically after a successful collection and is never sent
-to a server.
+Set `WINBAR_CONFIG_FILE=/path/to/settings.env` when running `install.sh` or
+`uninstall.sh` to use a differently named local file. Values for numeric
+settings are clamped to a minimum of one.
+
+## Historical dashboard
+
+Each successful collection appends one sample to SQLite and regenerates a
+self-contained HTML report. The SwiftBar menu only contains a
+`View history` action; all summaries and charts are shown in the browser.
+
+The report provides 24-hour, 7-day, and 30-day views for CPU/GPU utilization,
+memory/VRAM, GPU temperature/power, and network rates. Multi-GPU history uses
+the highest utilization and temperature plus combined VRAM and power. Failed
+collections are omitted instead of being stored as zero values. No external
+JavaScript, analytics, fonts, or network requests are used by the report.
 
 ## Security and privacy
 
 The plugin sends one encoded, read-only PowerShell command over SSH. It does
 not upload metrics, accept inbound connections, or store credentials. SSH
-keys and the cache remain under the user's control. Review the command and
-the [security policy](SECURITY.md) before deploying on a managed machine.
+keys, cache, history, and report remain under the user's control. The cache can
+contain a hostname and process names; history reveals machine-usage patterns.
+Do not attach generated files to public issues. Review the command and the
+[security policy](SECURITY.md) before deploying on a managed machine.
 
 ## Uninstall
 
@@ -100,11 +135,16 @@ Run the same configuration used for installation:
 ./uninstall.sh
 ```
 
-This removes generated SwiftBar files and leaves the local cache untouched.
-Delete the cache manually if desired:
+This removes generated SwiftBar files and its copied configuration. It leaves
+the source `.winbar.env`, cache, history, and report untouched. Delete local
+monitoring data manually if desired:
 
 ```sh
 rm -f "$HOME/.cache/winbar-monitor/cache.json"
+rm -f "$HOME/.local/share/winbar-monitor/history.sqlite3" \
+      "$HOME/.local/share/winbar-monitor/history.sqlite3-shm" \
+      "$HOME/.local/share/winbar-monitor/history.sqlite3-wal" \
+      "$HOME/.local/share/winbar-monitor/history.html"
 ```
 
 ## Troubleshooting
@@ -125,14 +165,15 @@ Run the standard-library test suite and shell syntax checks:
 
 ```sh
 python3 -m unittest discover -s tests -v
-sh -n install.sh uninstall.sh winbar.1m.py
+python3 -m py_compile winbar_monitor.py winbar.1m.py
+sh -n install.sh uninstall.sh
 ```
 
 Tests use synthetic fixtures only; CI never makes a real SSH connection.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow.
 
-No screenshot is included in this initial release: a safe screenshot would
-require a live host, so the documentation and tests use synthetic data only.
+No live-host screenshot or generated report is committed. Tests use synthetic
+fixtures so repository artifacts do not expose machine data.
 
 ## License
 

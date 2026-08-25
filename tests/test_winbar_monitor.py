@@ -1,6 +1,7 @@
 import json
 import os
 import base64
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -76,9 +77,11 @@ class ParserTests(unittest.TestCase):
         self.assertIn("CPU 占用 · N/A", lines)
         self.assertTrue(any(line.startswith("温度 · ") for line in lines))
         parameter_lines = [line for line in lines[1:] if " | " in line]
-        self.assertEqual(len(parameter_lines), 2)
-        self.assertTrue(parameter_lines[0].startswith("🔄 手动刷新"))
-        self.assertTrue(parameter_lines[1].startswith("🔐 打开 SSH"))
+        self.assertEqual(len(parameter_lines), 3)
+        self.assertTrue(parameter_lines[0].startswith("📊 查看历史统计"))
+        self.assertIn("bash=/usr/bin/open", parameter_lines[0])
+        self.assertTrue(parameter_lines[1].startswith("🔄 手动刷新"))
+        self.assertTrue(parameter_lines[2].startswith("🔐 打开 SSH"))
         self.assertIn("🖥️ TEST-WINDOWS", lines)
 
     def test_render_hostname_fallback_order(self):
@@ -97,6 +100,21 @@ class ParserTests(unittest.TestCase):
 
 
 class CacheAndTimeoutTests(unittest.TestCase):
+    def test_local_config_is_loaded_without_execution(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config_path = Path(folder) / ".winbar.env"
+            config_path.write_text(
+                "WINBAR_SSH_ALIAS=lab-monitor\n"
+                "WINBAR_RETENTION_DAYS=14 # local policy\n"
+                "IGNORED_COMMAND=$(touch should-not-exist)\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"WINBAR_CONFIG_PATH": str(config_path)}, clear=True):
+                config = wm.Config.from_env()
+            self.assertEqual(config.ssh_alias, "lab-monitor")
+            self.assertEqual(config.retention_days, 14)
+            self.assertFalse((Path(folder) / "should-not-exist").exists())
+
     def test_config_boundary_values_are_safe(self):
         with patch.dict(os.environ, {
             "WINBAR_REFRESH_SECONDS": "0",
@@ -140,6 +158,45 @@ class CacheAndTimeoutTests(unittest.TestCase):
         self.assertIn("🔴 离线", printer.call_args.args[0])
 
 
+class HistoryTests(unittest.TestCase):
+    def test_records_prunes_and_generates_self_contained_report(self):
+        metrics = wm.normalize_metrics(json.loads((ROOT / "no_gpu.json").read_text()))
+        with tempfile.TemporaryDirectory() as folder:
+            history_path = Path(folder) / "history.sqlite3"
+            report_path = Path(folder) / "history.html"
+            now = 2_000_000.0
+            wm.record_history(history_path, metrics, now - 40 * 86400, retention_days=30)
+            wm.record_history(history_path, metrics, now, retention_days=30)
+            wm.write_history_report(history_path, report_path, now)
+
+            with sqlite3.connect(history_path) as database:
+                count = database.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+            self.assertEqual(count, 1)
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("WinBarMonitor 历史统计", report)
+            self.assertIn('"count":1', report)
+            self.assertIn("<canvas id=\"util\"", report)
+            self.assertNotIn("https://", report)
+
+    def test_history_aggregates_multiple_gpus(self):
+        metrics = wm.normalize_metrics({
+            "memory_total_bytes": 16 * 1024 ** 3,
+            "memory_free_bytes": 6 * 1024 ** 3,
+            "gpus": [
+                {"memory_used": 2048, "memory_total": 8192, "utilization_gpu": 40,
+                 "temperature": 50, "power_draw": 30},
+                {"memory_used": 1024, "memory_total": 4096, "utilization_gpu": 75,
+                 "temperature": 65, "power_draw": 20},
+            ],
+        })
+        values = dict(zip(wm.HISTORY_COLUMNS, wm._history_values(metrics)))
+        self.assertEqual(values["memory_used_bytes"], 10 * 1024 ** 3)
+        self.assertEqual(values["gpu_memory_used_bytes"], 3 * 1024 ** 3)
+        self.assertEqual(values["gpu_percent"], 75)
+        self.assertEqual(values["gpu_temperature"], 65)
+        self.assertEqual(values["gpu_power_watts"], 50)
+
+
 class RuntimeCompatibilityTests(unittest.TestCase):
     def test_macos_system_python_can_compile_plugin(self):
         interpreter = Path("/usr/bin/python3")
@@ -160,9 +217,12 @@ class RuntimeCompatibilityTests(unittest.TestCase):
     def test_install_keeps_support_module_hidden(self):
         project_root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as folder:
+            config_path = Path(folder) / "test.env"
+            config_path.write_text("WINBAR_SSH_ALIAS=test-monitor\n", encoding="utf-8")
             env = dict(os.environ)
             env["SWIFTBAR_PLUGIN_DIR"] = folder
             env["WINBAR_REFRESH_SECONDS"] = "7"
+            env["WINBAR_CONFIG_FILE"] = str(config_path)
             subprocess.run(
                 [str(project_root / "install.sh")],
                 cwd=project_root,
@@ -173,9 +233,12 @@ class RuntimeCompatibilityTests(unittest.TestCase):
             )
             plugin = Path(folder) / "winbar.7s.py"
             support = Path(folder) / ".winbar_lib" / "winbar_monitor.py"
+            installed_config = Path(folder) / ".winbar_lib" / ".winbar.env"
             self.assertTrue(plugin.exists())
             self.assertTrue(os.access(plugin, os.X_OK))
             self.assertTrue(support.exists())
+            self.assertTrue(installed_config.exists())
+            self.assertEqual(installed_config.stat().st_mode & 0o777, 0o600)
             self.assertFalse(os.access(support, os.X_OK))
             self.assertFalse((Path(folder) / "winbar_monitor.py").exists())
 
@@ -184,8 +247,12 @@ class RuntimeCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             env = dict(os.environ, SWIFTBAR_PLUGIN_DIR=folder, WINBAR_REFRESH_SECONDS="9")
             subprocess.run([str(project_root / "install.sh")], cwd=project_root, env=env, check=True, capture_output=True, text=True)
-            subprocess.run([str(project_root / "uninstall.sh")], cwd=project_root, env=env, check=True, capture_output=True, text=True)
+            env["WINBAR_REFRESH_SECONDS"] = "11"
+            subprocess.run([str(project_root / "install.sh")], cwd=project_root, env=env, check=True, capture_output=True, text=True)
             self.assertFalse((Path(folder) / "winbar.9s.py").exists())
+            self.assertTrue((Path(folder) / "winbar.11s.py").exists())
+            subprocess.run([str(project_root / "uninstall.sh")], cwd=project_root, env=env, check=True, capture_output=True, text=True)
+            self.assertFalse((Path(folder) / "winbar.11s.py").exists())
             self.assertFalse((Path(folder) / ".winbar_lib" / "winbar_monitor.py").exists())
 
 
