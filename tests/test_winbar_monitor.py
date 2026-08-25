@@ -35,6 +35,19 @@ class ParserTests(unittest.TestCase):
     def test_json_with_warning(self):
         self.assertEqual(wm._first_json_object("WARNING\n{" + '"cpu_percent": 1}' )["cpu_percent"], 1)
 
+    def test_render_uses_swiftbar_separator_only_for_actions(self):
+        raw = json.loads((ROOT / "na_gpu.json").read_text())
+        output = wm.render(wm.normalize_metrics(raw), collected_at=1000)
+        lines = output.splitlines()
+        self.assertTrue(lines[0].startswith("🟢 在线"))
+        self.assertNotIn("refreshOnOpen", output)
+        self.assertIn("CPU 占用 · N/A", lines)
+        self.assertTrue(any(line.startswith("温度 · ") for line in lines))
+        parameter_lines = [line for line in lines if " | " in line]
+        self.assertEqual(len(parameter_lines), 2)
+        self.assertTrue(parameter_lines[0].startswith("🔄 手动刷新"))
+        self.assertTrue(parameter_lines[1].startswith("🔐 打开 SSH"))
+
 
 class CacheAndTimeoutTests(unittest.TestCase):
     def test_timeout_uses_cache(self):

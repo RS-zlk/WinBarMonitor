@@ -252,16 +252,16 @@ def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = 
     power_text = f"{power_draw:.0f} W" if power_draw is not None else "N/A"
     state = "🟡 缓存" if stale else "🟢 在线"
     header = f"{state} · GPU {gpu_util} · CPU {cpu}"
-    lines = ["# <swiftbar.refreshOnOpen>true</swiftbar.refreshOnOpen>", header, "---", f"🖥️ Windows · {metrics.get('hostname', 'y9000p')}",
-             f"CPU 占用 | {cpu}", f"内存 | {_fmt_bytes(metrics.get('memory_total_bytes') - metrics.get('memory_free_bytes')) if metrics.get('memory_total_bytes') is not None and metrics.get('memory_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('memory_total_bytes'))}",
-             f"C盘 | {_fmt_bytes(metrics.get('disk_total_bytes') - metrics.get('disk_free_bytes')) if metrics.get('disk_total_bytes') is not None and metrics.get('disk_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('disk_total_bytes'))}",
-             f"网络 | ↓ {_fmt_rate(metrics.get('network_rx_bps'))} · ↑ {_fmt_rate(metrics.get('network_tx_bps'))}",
-             f"运行时间 | {_uptime(metrics.get('last_boot'))}", "---",
+    lines = [header, "---", f"🖥️ Windows · {metrics.get('hostname', 'y9000p')}",
+             f"CPU 占用 · {cpu}", f"内存 · {_fmt_bytes(metrics.get('memory_total_bytes') - metrics.get('memory_free_bytes')) if metrics.get('memory_total_bytes') is not None and metrics.get('memory_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('memory_total_bytes'))}",
+             f"C盘 · {_fmt_bytes(metrics.get('disk_total_bytes') - metrics.get('disk_free_bytes')) if metrics.get('disk_total_bytes') is not None and metrics.get('disk_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('disk_total_bytes'))}",
+             f"网络 · ↓ {_fmt_rate(metrics.get('network_rx_bps'))} · ↑ {_fmt_rate(metrics.get('network_tx_bps'))}",
+             f"运行时间 · {_uptime(metrics.get('last_boot'))}", "---",
              f"🎮 {gpu.get('name', 'NVIDIA GPU')}",
-             f"GPU 利用率 | {gpu_util}",
-             f"显存 | {_fmt_bytes(gpu.get('memory_used') * 1024 ** 2) if gpu.get('memory_used') is not None else 'N/A'} / {_fmt_bytes(gpu.get('memory_total') * 1024 ** 2) if gpu.get('memory_total') is not None else 'N/A'}",
-             f"温度 | {temperature_text}",
-             f"功耗 | {power_text}", "---", "🔥 Top 进程"]
+             f"GPU 利用率 · {gpu_util}",
+             f"显存 · {_fmt_bytes(gpu.get('memory_used') * 1024 ** 2) if gpu.get('memory_used') is not None else 'N/A'} / {_fmt_bytes(gpu.get('memory_total') * 1024 ** 2) if gpu.get('memory_total') is not None else 'N/A'}",
+             f"温度 · {temperature_text}",
+             f"功耗 · {power_text}", "---", "🔥 Top 进程"]
     processes = metrics.get("processes") or []
     for proc in processes[:5]:
         name = str(proc.get("name") or "?")[:24]
@@ -287,7 +287,7 @@ def main() -> int:
         if cached:
             print(render(normalize_metrics(cached), stale=True, error=f"连接失败：{exc}", collected_at=cached_at))
         else:
-            print(f"# <swiftbar.refreshOnOpen>true</swiftbar.refreshOnOpen>\n🔴 离线 · Windows\n---\n⚠️ {exc}\n---\n🔄 手动刷新 | refresh=true")
+            print(f"🔴 离线 · Windows\n---\n⚠️ {exc}\n---\n🔄 手动刷新 | refresh=true")
     return 0
 
 
