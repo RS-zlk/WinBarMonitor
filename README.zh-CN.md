@@ -119,6 +119,8 @@ sh -n install.sh uninstall.sh winbar.1m.py
 测试只使用合成 fixture；CI 不会发起真实 SSH 连接。贡献流程见
 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+首个版本暂不附带截图：制作安全截图需要真实主机，因此文档和测试只使用合成数据。
+
 ## 许可证
 
 MIT，详见 [LICENSE](LICENSE)。

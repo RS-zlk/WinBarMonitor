@@ -131,6 +131,9 @@ sh -n install.sh uninstall.sh winbar.1m.py
 Tests use synthetic fixtures only; CI never makes a real SSH connection.
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow.
 
+No screenshot is included in this initial release: a safe screenshot would
+require a live host, so the documentation and tests use synthetic data only.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
