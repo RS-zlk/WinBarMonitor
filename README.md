@@ -9,7 +9,18 @@ WinBarMonitor 是一个零依赖的 SwiftBar 插件：在 macOS 顶部菜单栏�
 3. 确认 Mac 已可无交互执行 `ssh y9000p-remote`（推荐 SSH key，不要把密码或私钥写入仓库）。
 4. SwiftBar 选择刷新插件。插件默认每 30 秒刷新，点击顶部图标即可展开实时指标。
 
-环境变量：`WINBAR_SSH_ALIAS`（默认 `y9000p-remote`）、`WINBAR_REFRESH_SECONDS`（默认 30）、`WINBAR_SSH_TIMEOUT`（默认 15）、`WINBAR_CACHE_PATH`（默认 `~/.cache/winbar-monitor/cache.json`）。安装时 `WINBAR_REFRESH_SECONDS=10 ./install.sh` 会生成 `winbar.10s.py`，SwiftBar 按文件名每 10 秒刷新；插件点击时也会先刷新一次。远程 CIM 查询在慢链路上可能需要数秒，插件会使用 SSH 连接复用来降低后续刷新延迟。
+环境变量：`WINBAR_SSH_ALIAS`（默认 `y9000p-remote`）、`WINBAR_REFRESH_SECONDS`（默认 30）、`WINBAR_SSH_TIMEOUT`（默认 15）、`WINBAR_CACHE_PATH`（默认 `~/.cache/winbar-monitor/cache.json`）。安装时 `WINBAR_REFRESH_SECONDS=10 ./install.sh` 会生成 `winbar.10s.py`，SwiftBar 按文件名每 10 秒在后台刷新；点击插件图标会立即显示最近一次结果，需要即时重新采集时可选择菜单中的“手动刷新”。远程 CIM 查询在慢链路上可能需要数秒，插件会使用 SSH 连接复用来降低后续刷新延迟。
+
+## 历史统计
+
+每次成功采集都会写入本机 SQLite 数据库，并更新一个不依赖网络的 HTML 报告。SwiftBar 菜单中的“📊 查看历史统计”会用默认浏览器打开报告；菜单本身不展示统计摘要。报告提供最近 24 小时、7 天和 30 天的 CPU/GPU、内存/显存、温度/功耗及网络速率图表。
+
+- 数据库：`~/.local/share/winbar-monitor/history.sqlite3`
+- HTML 报告：`~/.local/share/winbar-monitor/history.html`
+- 原始数据默认保留 30 天，过期数据在成功采集时自动清理
+- SSH 失败期间不写入虚假的零值，也不会覆盖已有历史报告
+
+可用 `WINBAR_HISTORY_PATH`、`WINBAR_REPORT_PATH` 和 `WINBAR_RETENTION_DAYS` 修改上述路径及保留天数。卸载插件时历史数据库与报告会保留，便于备份或手动删除。
 
 ## 安全与网络
 
@@ -22,7 +33,7 @@ python3 -m unittest discover -s tests -v
 ./uninstall.sh
 ```
 
-测试覆盖 NVIDIA CSV 的 `N/A`、无 GPU JSON、异常值归一化、PowerShell 警告前缀 JSON 和缓存读取。真实连接测试由用户环境决定：`ssh y9000p-remote` 应先在 Mac 终端通过。
+测试覆盖 NVIDIA CSV 的 `N/A`、无 GPU JSON、异常值归一化、PowerShell 警告前缀 JSON、缓存读取、历史数据保留和自包含 HTML 报告。真实连接测试由用户环境决定：`ssh y9000p-remote` 应先在 Mac 终端通过。
 
 ## 已知限制
 

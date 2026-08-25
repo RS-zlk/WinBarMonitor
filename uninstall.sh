@@ -9,4 +9,4 @@ esac
 rm -f "$PLUGIN_DIR/winbar.${REFRESH_SECONDS}s.py" "$PLUGIN_DIR/winbar.1m.py" "$PLUGIN_DIR/winbar_monitor.py"
 rm -f "$PLUGIN_DIR/.winbar_lib/winbar_monitor.py"
 rmdir "$PLUGIN_DIR/.winbar_lib" 2>/dev/null || true
-echo "已移除 WinBarMonitor 插件文件（缓存保留在 ~/.cache/winbar-monitor）。"
+echo "已移除 WinBarMonitor 插件文件（缓存及 ~/.local/share/winbar-monitor 历史数据均保留）。"

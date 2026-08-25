@@ -50,9 +50,11 @@ class ParserTests(unittest.TestCase):
         self.assertIn("CPU 占用 · N/A", lines)
         self.assertTrue(any(line.startswith("温度 · ") for line in lines))
         parameter_lines = [line for line in lines[1:] if " | " in line]
-        self.assertEqual(len(parameter_lines), 2)
-        self.assertTrue(parameter_lines[0].startswith("🔄 手动刷新"))
-        self.assertTrue(parameter_lines[1].startswith("🔐 打开 SSH"))
+        self.assertEqual(len(parameter_lines), 3)
+        self.assertTrue(parameter_lines[0].startswith("📊 查看历史统计"))
+        self.assertIn("bash=/usr/bin/open", parameter_lines[0])
+        self.assertTrue(parameter_lines[1].startswith("🔄 手动刷新"))
+        self.assertTrue(parameter_lines[2].startswith("🔐 打开 SSH"))
 
     def test_status_icons_use_distinct_colored_png_data(self):
         icons = {color: wm._desktop_icon_png(color) for color in ("green", "yellow", "red")}
@@ -86,19 +88,58 @@ class CacheAndTimeoutTests(unittest.TestCase):
         self.assertNotEqual(value, "N/A")
 
 
+class HistoryTests(unittest.TestCase):
+    def test_records_prunes_and_generates_self_contained_report(self):
+        metrics = wm.normalize_metrics(json.loads((ROOT / "no_gpu.json").read_text()))
+        with tempfile.TemporaryDirectory() as folder:
+            history_path = Path(folder) / "history.sqlite3"
+            report_path = Path(folder) / "history.html"
+            now = 2_000_000.0
+            wm.record_history(history_path, metrics, now - 40 * 86400, retention_days=30)
+            wm.record_history(history_path, metrics, now, retention_days=30)
+            wm.write_history_report(history_path, report_path, now)
+
+            import sqlite3
+            with sqlite3.connect(history_path) as database:
+                count = database.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+            self.assertEqual(count, 1)
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("WinBarMonitor 历史统计", report)
+            self.assertIn('"count":1', report)
+            self.assertIn("<canvas id=\"util\"", report)
+            self.assertNotIn("https://", report)
+
+    def test_history_converts_memory_and_gpu_units(self):
+        metrics = wm.normalize_metrics(json.loads((ROOT / "na_gpu.json").read_text()))
+        metrics.update({"memory_total_bytes": 16 * 1024 ** 3, "memory_free_bytes": 6 * 1024 ** 3})
+        metrics["gpus"][0].update({"memory_used": 2048, "memory_total": 8192})
+        values = dict(zip(wm.HISTORY_COLUMNS, wm._history_values(metrics)))
+        self.assertEqual(values["memory_used_bytes"], 10 * 1024 ** 3)
+        self.assertEqual(values["gpu_memory_used_bytes"], 2 * 1024 ** 3)
+
+
 class RuntimeCompatibilityTests(unittest.TestCase):
     def test_macos_system_python_can_compile_plugin(self):
         interpreter = Path("/usr/bin/python3")
         if not interpreter.exists():
             self.skipTest("macOS system Python is unavailable")
         project_root = Path(__file__).resolve().parents[1]
-        subprocess.run(
-            [str(interpreter), "-m", "py_compile", "winbar_monitor.py", "winbar.1m.py"],
-            cwd=project_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        with tempfile.TemporaryDirectory() as pycache:
+            env = dict(os.environ)
+            env["PYTHONPYCACHEPREFIX"] = pycache
+            subprocess.run(
+                [str(interpreter), "-m", "py_compile", "winbar_monitor.py", "winbar.1m.py"],
+                cwd=project_root,
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+    def test_plugin_does_not_refresh_on_open(self):
+        project_root = Path(__file__).resolve().parents[1]
+        plugin = (project_root / "winbar.1m.py").read_text(encoding="utf-8")
+        self.assertNotIn("swiftbar.refreshOnOpen", plugin)
 
     def test_install_keeps_support_module_hidden(self):
         project_root = Path(__file__).resolve().parents[1]
