@@ -17,6 +17,7 @@ python3 -m unittest discover -s tests -v
 sh -n install.sh uninstall.sh winbar.1m.py
 ```
 
-Document user-visible changes in `CHANGELOG.md`. Keep commits focused and use
-clear imperative messages. Pull requests should explain the behavior change,
-test coverage, and any security implications.
+Document user-visible changes in `CHANGELOG.md`. Keep commits focused and write
+commit messages in English using `<type>: <imperative description>`, for example
+`fix: handle an unavailable GPU`. Pull requests should explain the behavior
+change, test coverage, and any security implications.
