@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,6 +46,33 @@ class CacheAndTimeoutTests(unittest.TestCase):
                 cached, at = wm.read_cache(config.cache_path)
             self.assertIsNotNone(cached)
             self.assertEqual(at, 1000)
+
+    def test_remote_timeout_message_is_short(self):
+        with patch(
+            "winbar_monitor.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["ssh", "encoded-command"], timeout=1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"SSH/PowerShell 采集超时（1 秒）"):
+                wm.collect_remote(wm.Config(ssh_timeout=1))
+
+    def test_windows_seven_digit_boot_time(self):
+        value = wm._uptime("2020-01-02T03:04:05.5000000+08:00")
+        self.assertNotEqual(value, "N/A")
+
+
+class RuntimeCompatibilityTests(unittest.TestCase):
+    def test_macos_system_python_can_compile_plugin(self):
+        interpreter = Path("/usr/bin/python3")
+        if not interpreter.exists():
+            self.skipTest("macOS system Python is unavailable")
+        project_root = Path(__file__).resolve().parents[1]
+        subprocess.run(
+            [str(interpreter), "-m", "py_compile", "winbar_monitor.py", "winbar.1m.py"],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ from typing import Any, Iterable
 
 
 DEFAULT_REFRESH_SECONDS = 30
-DEFAULT_SSH_TIMEOUT = 5
+DEFAULT_SSH_TIMEOUT = 15
 DEFAULT_CACHE_PATH = Path.home() / ".cache" / "winbar-monitor" / "cache.json"
 
 
@@ -160,11 +160,16 @@ def normalize_metrics(raw: dict[str, Any]) -> dict[str, Any]:
 def collect_remote(config: Config) -> dict[str, Any]:
     encoded = base64.b64encode(POWERSHELL_SCRIPT.encode("utf-16le")).decode("ascii")
     command = [
-        "ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={config.ssh_timeout}",
+        "ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={min(config.ssh_timeout, 5)}",
+        "-o", "ControlMaster=auto", "-o", "ControlPersist=60",
+        "-o", "ControlPath=~/.ssh/winbar-%C",
         config.ssh_alias, "powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded,
     ]
-    completed = subprocess.run(command, capture_output=True, text=True,
-                               errors="replace", timeout=config.ssh_timeout + 3)
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   errors="replace", timeout=config.ssh_timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"SSH/PowerShell 采集超时（{config.ssh_timeout} 秒）") from None
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip().splitlines()
         raise RuntimeError(detail[-1] if detail else f"ssh 返回码 {completed.returncode}")
@@ -220,7 +225,11 @@ def _uptime(last_boot: Any, now: float | None = None) -> str:
     if not last_boot:
         return "N/A"
     try:
-        boot = datetime.fromisoformat(str(last_boot).replace("Z", "+00:00"))
+        boot_text = str(last_boot).replace("Z", "+00:00")
+        # Windows CIM commonly emits seven fractional-second digits, while the
+        # system Python bundled with older macOS releases accepts at most six.
+        boot_text = re.sub(r"(\.\d{6})\d+(?=[+-]\d{2}:\d{2}$)", r"\1", boot_text)
+        boot = datetime.fromisoformat(boot_text)
         if boot.tzinfo is None:
             boot = boot.replace(tzinfo=timezone.utc)
         seconds = max(0, int((datetime.now(timezone.utc) - boot).total_seconds()))
@@ -237,6 +246,10 @@ def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = 
     gpu = (metrics.get("gpus") or [{}])[0]
     cpu = _percent(metrics.get("cpu_percent"))
     gpu_util = _percent(gpu.get("utilization_gpu"))
+    temperature = gpu.get("temperature")
+    power_draw = gpu.get("power_draw")
+    temperature_text = f"{temperature:.0f}°C" if temperature is not None else "N/A"
+    power_text = f"{power_draw:.0f} W" if power_draw is not None else "N/A"
     state = "🟡 缓存" if stale else "🟢 在线"
     header = f"{state} · GPU {gpu_util} · CPU {cpu}"
     lines = ["# <swiftbar.refreshOnOpen>true</swiftbar.refreshOnOpen>", header, "---", f"🖥️ Windows · {metrics.get('hostname', 'y9000p')}",
@@ -247,8 +260,8 @@ def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = 
              f"🎮 {gpu.get('name', 'NVIDIA GPU')}",
              f"GPU 利用率 | {gpu_util}",
              f"显存 | {_fmt_bytes(gpu.get('memory_used') * 1024 ** 2) if gpu.get('memory_used') is not None else 'N/A'} / {_fmt_bytes(gpu.get('memory_total') * 1024 ** 2) if gpu.get('memory_total') is not None else 'N/A'}",
-             f"温度 | {f'{gpu.get("temperature"):.0f}°C' if gpu.get('temperature') is not None else 'N/A'}",
-             f"功耗 | {f'{gpu.get("power_draw"):.0f} W' if gpu.get('power_draw') is not None else 'N/A'}", "---", "🔥 Top 进程"]
+             f"温度 | {temperature_text}",
+             f"功耗 | {power_text}", "---", "🔥 Top 进程"]
     processes = metrics.get("processes") or []
     for proc in processes[:5]:
         name = str(proc.get("name") or "?")[:24]

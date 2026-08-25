@@ -9,11 +9,11 @@ WinBarMonitor 是一个零依赖的 SwiftBar 插件：在 macOS 顶部菜单栏�
 3. 确认 Mac 已可无交互执行 `ssh y9000p-remote`（推荐 SSH key，不要把密码或私钥写入仓库）。
 4. SwiftBar 选择刷新插件。插件默认每 30 秒刷新，点击顶部图标即可展开实时指标。
 
-环境变量：`WINBAR_SSH_ALIAS`（默认 `y9000p-remote`）、`WINBAR_REFRESH_SECONDS`（默认 30）、`WINBAR_SSH_TIMEOUT`（默认 5）、`WINBAR_CACHE_PATH`（默认 `~/.cache/winbar-monitor/cache.json`）。安装时 `WINBAR_REFRESH_SECONDS=10 ./install.sh` 会生成 `winbar.10s.py`，SwiftBar 按文件名每 10 秒刷新；插件点击时也会先刷新一次。
+环境变量：`WINBAR_SSH_ALIAS`（默认 `y9000p-remote`）、`WINBAR_REFRESH_SECONDS`（默认 30）、`WINBAR_SSH_TIMEOUT`（默认 15）、`WINBAR_CACHE_PATH`（默认 `~/.cache/winbar-monitor/cache.json`）。安装时 `WINBAR_REFRESH_SECONDS=10 ./install.sh` 会生成 `winbar.10s.py`，SwiftBar 按文件名每 10 秒刷新；插件点击时也会先刷新一次。远程 CIM 查询在慢链路上可能需要数秒，插件会使用 SSH 连接复用来降低后续刷新延迟。
 
 ## 安全与网络
 
-插件使用 `ssh -o BatchMode=yes -o ConnectTimeout=5`，连接失败会快速返回。最近一次成功结果保存在本机缓存，离线时显示“缓存”状态和错误信息，不会卡住菜单栏。建议通过 Tailscale/SSH 隧道连接，不要把 PowerShell/监控端口暴露到公网；SSH 服务本身请使用密钥、最小权限账号和防火墙白名单。阿里云服务器可作为 Tailscale/反向 SSH 的中继，但本插件不需要把指标上传到服务器。
+插件使用 `BatchMode=yes` 和 5 秒连接建立超时，整次采集默认最多等待 15 秒。最近一次成功结果保存在本机缓存，离线时显示“缓存”状态和简短错误信息，不会卡住菜单栏。建议通过 Tailscale/SSH 隧道连接，不要把 PowerShell/监控端口暴露到公网；SSH 服务本身请使用密钥、最小权限账号和防火墙白名单。阿里云服务器可作为 Tailscale/反向 SSH 的中继，但本插件不需要把指标上传到服务器。
 
 ## 开发与测试
 
