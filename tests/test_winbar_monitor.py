@@ -1,5 +1,6 @@
 import json
 import os
+import base64
 import subprocess
 import tempfile
 import unittest
@@ -39,8 +40,10 @@ class ParserTests(unittest.TestCase):
         raw = json.loads((ROOT / "na_gpu.json").read_text())
         output = wm.render(wm.normalize_metrics(raw), collected_at=1000)
         lines = output.splitlines()
-        self.assertIn("sfimage=desktopcomputer", lines[0])
-        self.assertIn("sfcolor=green", lines[0])
+        self.assertIn("image=", lines[0])
+        self.assertNotIn("sfimage=", lines[0])
+        encoded_icon = lines[0].split("image=", 1)[1].split(" ", 1)[0]
+        self.assertTrue(base64.b64decode(encoded_icon).startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertIn("dropdown=false", lines[0])
         self.assertIn("🟢 在线 · GPU", lines[2])
         self.assertNotIn("refreshOnOpen", output)
@@ -50,6 +53,12 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(len(parameter_lines), 2)
         self.assertTrue(parameter_lines[0].startswith("🔄 手动刷新"))
         self.assertTrue(parameter_lines[1].startswith("🔐 打开 SSH"))
+
+    def test_status_icons_use_distinct_colored_png_data(self):
+        icons = {color: wm._desktop_icon_png(color) for color in ("green", "yellow", "red")}
+        self.assertEqual(len(set(icons.values())), 3)
+        for png in icons.values():
+            self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
 
 
 class CacheAndTimeoutTests(unittest.TestCase):

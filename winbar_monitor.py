@@ -8,11 +8,14 @@ SSH.  It is intentionally dependency-free so it can run with macOS' Python 3.
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import os
 import re
+import struct
 import subprocess
 import time
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -221,9 +224,53 @@ def _percent(value: Any) -> str:
     return "N/A" if number is None else f"{number:.0f}%"
 
 
+ICON_COLORS = {
+    "green": (52, 199, 89),
+    "yellow": (255, 204, 0),
+    "red": (255, 59, 48),
+}
+
+
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    checksum = binascii.crc32(kind + payload) & 0xFFFFFFFF
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+
+
+def _desktop_icon_png(color: str) -> bytes:
+    """Create a tiny RGBA desktop-monitor PNG without external dependencies."""
+    width = height = 18
+    red, green, blue = ICON_COLORS[color]
+    pixels = bytearray(width * height * 4)
+
+    def paint(x: int, y: int, alpha: int = 255) -> None:
+        offset = (y * width + x) * 4
+        pixels[offset:offset + 4] = bytes((red, green, blue, alpha))
+
+    # Rounded monitor outline with a lightly tinted screen.
+    for y in range(3, 11):
+        for x in range(2, 16):
+            border = y in (3, 10) or x in (2, 15)
+            if border and not ((x, y) in ((2, 3), (15, 3), (2, 10), (15, 10))):
+                paint(x, y)
+            elif not border:
+                paint(x, y, 64)
+    # Neck and base.
+    for y in range(11, 14):
+        for x in range(8, 10):
+            paint(x, y)
+    for y in range(14, 16):
+        for x in range(5, 13):
+            paint(x, y)
+
+    scanlines = b"".join(b"\x00" + pixels[y * width * 4:(y + 1) * width * 4] for y in range(height))
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + _png_chunk(b"IHDR", header) + _png_chunk(b"IDAT", zlib.compress(scanlines, 9)) + _png_chunk(b"IEND", b"")
+
+
 def _menu_icon(color: str) -> str:
-    """Render an icon-only SwiftBar title and hide it from the dropdown."""
-    return f"\u200b | sfimage=desktopcomputer sfcolor={color} dropdown=false"
+    """Render a color-preserving PNG as an icon-only SwiftBar title."""
+    encoded = base64.b64encode(_desktop_icon_png(color)).decode("ascii")
+    return f"\u200b | image={encoded} dropdown=false"
 
 
 def _uptime(last_boot: Any, now: float | None = None) -> str:
