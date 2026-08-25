@@ -239,7 +239,7 @@ def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = 
     gpu_util = _percent(gpu.get("utilization_gpu"))
     state = "🟡 缓存" if stale else "🟢 在线"
     header = f"{state} · GPU {gpu_util} · CPU {cpu}"
-    lines = [header, "---", f"🖥️ Windows · {metrics.get('hostname', 'y9000p')}",
+    lines = ["# <swiftbar.refreshOnOpen>true</swiftbar.refreshOnOpen>", header, "---", f"🖥️ Windows · {metrics.get('hostname', 'y9000p')}",
              f"CPU 占用 | {cpu}", f"内存 | {_fmt_bytes(metrics.get('memory_total_bytes') - metrics.get('memory_free_bytes')) if metrics.get('memory_total_bytes') is not None and metrics.get('memory_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('memory_total_bytes'))}",
              f"C盘 | {_fmt_bytes(metrics.get('disk_total_bytes') - metrics.get('disk_free_bytes')) if metrics.get('disk_total_bytes') is not None and metrics.get('disk_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('disk_total_bytes'))}",
              f"网络 | ↓ {_fmt_rate(metrics.get('network_rx_bps'))} · ↑ {_fmt_rate(metrics.get('network_tx_bps'))}",
@@ -274,7 +274,7 @@ def main() -> int:
         if cached:
             print(render(normalize_metrics(cached), stale=True, error=f"连接失败：{exc}", collected_at=cached_at))
         else:
-            print(f"🔴 离线 · Windows\n---\n⚠️ {exc}\n---\n🔄 手动刷新 | refresh=true")
+            print(f"# <swiftbar.refreshOnOpen>true</swiftbar.refreshOnOpen>\n🔴 离线 · Windows\n---\n⚠️ {exc}\n---\n🔄 手动刷新 | refresh=true")
     return 0
 
 

@@ -9,7 +9,7 @@ WinBarMonitor 是一个零依赖的 SwiftBar 插件：在 macOS 顶部菜单栏�
 3. 确认 Mac 已可无交互执行 `ssh y9000p-remote`（推荐 SSH key，不要把密码或私钥写入仓库）。
 4. SwiftBar 选择刷新插件。插件默认每 30 秒刷新，点击顶部图标即可展开实时指标。
 
-环境变量：`WINBAR_SSH_ALIAS`（默认 `y9000p-remote`）、`WINBAR_REFRESH_SECONDS`（默认 30）、`WINBAR_SSH_TIMEOUT`（默认 5）、`WINBAR_CACHE_PATH`（默认 `~/.cache/winbar-monitor/cache.json`）。SwiftBar 插件文件名中的 `1m` 是它的刷新兜底周期，环境变量可将采集窗口设得更短。
+环境变量：`WINBAR_SSH_ALIAS`（默认 `y9000p-remote`）、`WINBAR_REFRESH_SECONDS`（默认 30）、`WINBAR_SSH_TIMEOUT`（默认 5）、`WINBAR_CACHE_PATH`（默认 `~/.cache/winbar-monitor/cache.json`）。安装时 `WINBAR_REFRESH_SECONDS=10 ./install.sh` 会生成 `winbar.10s.py`，SwiftBar 按文件名每 10 秒刷新；插件点击时也会先刷新一次。
 
 ## 安全与网络
 
