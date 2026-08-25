@@ -5,6 +5,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -169,13 +170,16 @@ class HistoryTests(unittest.TestCase):
             wm.record_history(history_path, metrics, now, retention_days=30)
             wm.write_history_report(history_path, report_path, now)
 
-            with sqlite3.connect(history_path) as database:
+            with closing(sqlite3.connect(history_path)) as database:
                 count = database.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
             self.assertEqual(count, 1)
             report = report_path.read_text(encoding="utf-8")
             self.assertIn("WinBarMonitor 历史统计", report)
             self.assertIn('"count":1', report)
             self.assertIn("<canvas id=\"util\"", report)
+            self.assertIn("className='tooltip'", report)
+            self.assertIn("canvas.onmousemove", report)
+            self.assertIn("tooltip-time", report)
             self.assertNotIn("https://", report)
 
     def test_history_aggregates_multiple_gpus(self):

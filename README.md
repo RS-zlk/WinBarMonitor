@@ -117,6 +117,7 @@ memory/VRAM, GPU temperature/power, and network rates. Multi-GPU history uses
 the highest utilization and temperature plus combined VRAM and power. Failed
 collections are omitted instead of being stored as zero values. No external
 JavaScript, analytics, fonts, or network requests are used by the report.
+Hover over a chart point to see its local timestamp and series values.
 
 ## Security and privacy
 

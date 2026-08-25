@@ -11,6 +11,7 @@ All notable changes to this project are documented here.
 - Self-contained 24-hour, 7-day, and 30-day browser dashboard.
 - SwiftBar action for opening the dashboard without showing statistics in the
   menu itself.
+- Hover tooltips that show the timestamp and values for chart data points.
 
 ### Changed
 

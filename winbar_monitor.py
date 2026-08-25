@@ -18,6 +18,7 @@ import struct
 import subprocess
 import time
 import zlib
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -298,19 +299,20 @@ def record_history(path: Path, metrics: dict[str, Any], collected_at: float,
     definitions = ",\n                ".join(f"{column} REAL" for column in HISTORY_COLUMNS)
     placeholders = ", ".join("?" for _ in range(len(HISTORY_COLUMNS) + 1))
     columns = ", ".join(("collected_at",) + HISTORY_COLUMNS)
-    with sqlite3.connect(str(path), timeout=5) as database:
-        database.execute("PRAGMA journal_mode=WAL")
-        database.execute(f"""
-            CREATE TABLE IF NOT EXISTS samples (
-                collected_at REAL PRIMARY KEY,
-                {definitions}
+    with closing(sqlite3.connect(str(path), timeout=5)) as database:
+        with database:
+            database.execute("PRAGMA journal_mode=WAL")
+            database.execute(f"""
+                CREATE TABLE IF NOT EXISTS samples (
+                    collected_at REAL PRIMARY KEY,
+                    {definitions}
+                )
+            """)
+            database.execute(
+                f"INSERT OR REPLACE INTO samples ({columns}) VALUES ({placeholders})",
+                (collected_at,) + _history_values(metrics),
             )
-        """)
-        database.execute(
-            f"INSERT OR REPLACE INTO samples ({columns}) VALUES ({placeholders})",
-            (collected_at,) + _history_values(metrics),
-        )
-        database.execute("DELETE FROM samples WHERE collected_at < ?", (collected_at - retention_days * 86400,))
+            database.execute("DELETE FROM samples WHERE collected_at < ?", (collected_at - retention_days * 86400,))
 
 
 def _query_report_range(database: sqlite3.Connection, now: float, seconds: int,
@@ -362,7 +364,7 @@ REPORT_TEMPLATE = r'''<!doctype html>
 main{max-width:1180px;margin:auto;padding:32px 22px 48px}header{display:flex;gap:18px;align-items:end;justify-content:space-between;margin-bottom:24px}h1{font-size:28px;margin:0 0 6px}.sub{color:var(--muted)}
 .tabs{display:flex;gap:8px}.tabs button{border:1px solid var(--line);background:#10182a;color:var(--muted);border-radius:10px;padding:8px 14px;cursor:pointer}.tabs button.active{background:#284f85;color:#fff;border-color:#4b85c7}
 .cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-bottom:18px}.card,.chart{background:linear-gradient(145deg,#171f34,#11182a);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 35px #0004}.card{padding:16px}.label{color:var(--muted);font-size:12px}.value{font-size:23px;font-weight:650;margin:7px 0}.detail{color:var(--muted);font-size:12px}
-.charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}.chart{padding:16px}.chart h2{font-size:15px;margin:0 0 12px}.canvas-wrap{height:245px;position:relative}canvas{width:100%;height:100%}
+.charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}.chart{padding:16px}.chart h2{font-size:15px;margin:0 0 12px}.canvas-wrap{height:245px;position:relative}canvas{width:100%;height:100%;cursor:crosshair}.tooltip{position:absolute;display:none;z-index:2;pointer-events:none;min-width:170px;padding:10px 12px;border:1px solid #405170;border-radius:9px;background:#090e1beF;box-shadow:0 8px 24px #0008;color:var(--text);font-size:12px;line-height:1.5}.tooltip-time{margin-bottom:5px;color:#c9d7ef;font-weight:600}.tooltip-row{display:flex;align-items:center;justify-content:space-between;gap:18px}.tooltip-label{display:flex;align-items:center;gap:6px;color:var(--muted)}.tooltip-dot{width:7px;height:7px;border-radius:50%}
 footer{color:var(--muted);margin-top:20px;font-size:12px}@media(max-width:850px){header{align-items:start;flex-direction:column}.cards{grid-template-columns:repeat(2,1fr)}.charts{grid-template-columns:1fr}}@media(max-width:480px){.cards{grid-template-columns:1fr}}
 </style>
 </head>
@@ -377,18 +379,50 @@ footer{color:var(--muted);margin-top:20px;font-size:12px}@media(max-width:850px)
 </section><footer id="footer"></footer>
 </main>
 <script>
-const DATA=__REPORT_DATA__;const colors=['#5aa7ff','#54d69b','#ffb454','#ed75b8'];
-const finite=v=>Number.isFinite(v);const fmt=(v,d=1)=>finite(v)?v.toFixed(d):'N/A';const gb=v=>finite(v)?v/1073741824:null;const mbps=v=>finite(v)?v/1048576:null;
+const DATA=__REPORT_DATA__;
+const colors=['#5aa7ff','#54d69b','#ffb454','#ed75b8'];
+const finite=v=>Number.isFinite(v);
+const fmt=(v,d=1)=>finite(v)?v.toFixed(d):'N/A';
+const gb=v=>finite(v)?v/1073741824:null;
+const mbps=v=>finite(v)?v/1048576:null;
 function card(label,value,detail){return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div><div class="detail">${detail}</div></div>`}
-function draw(id,timestamps,lines,unit,fixedMax=null){const canvas=document.getElementById(id),box=canvas.parentElement,dpr=devicePixelRatio||1,w=box.clientWidth,h=box.clientHeight;canvas.width=w*dpr;canvas.height=h*dpr;const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);const values=lines.flatMap(x=>x.values).filter(finite);if(!timestamps.length||!values.length){c.fillStyle='#91a0ba';c.textAlign='center';c.fillText('暂无数据',w/2,h/2);return}const pad={l:45,r:14,t:24,b:30},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b,min=0,max=fixedMax||Math.max(...values)*1.12||1;c.strokeStyle='#26324b';c.fillStyle='#91a0ba';c.font='11px -apple-system';c.textAlign='right';for(let i=0;i<=4;i++){const y=pad.t+ch*i/4;c.beginPath();c.moveTo(pad.l,y);c.lineTo(w-pad.r,y);c.stroke();c.fillText(fmt(max*(1-i/4),max<10?1:0)+unit,pad.l-7,y+4)}const first=timestamps[0],last=timestamps[timestamps.length-1]||first+1;lines.forEach((line,index)=>{c.strokeStyle=colors[index];c.lineWidth=2;c.beginPath();let started=false;line.values.forEach((v,i)=>{if(!finite(v))return;const x=pad.l+cw*((timestamps[i]-first)/Math.max(1,last-first)),y=pad.t+ch*(1-(v-min)/Math.max(1,max-min));started?c.lineTo(x,y):c.moveTo(x,y);started=true});c.stroke();c.fillStyle=colors[index];c.textAlign='left';c.fillText(line.name,pad.l+index*90,13)});c.fillStyle='#91a0ba';c.textAlign='left';c.fillText(new Date(first*1000).toLocaleString(),pad.l,h-8);c.textAlign='right';c.fillText(new Date(last*1000).toLocaleString(),w-pad.r,h-8)}
-function render(key){const range=DATA.ranges[key],s=range.stats,q=range.series;document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active',b.dataset.range===key));const cpu=s.cpu_percent,gpu=s.gpu_percent,mem=s.memory_used_bytes,temp=s.gpu_temperature,netRx=s.network_rx_bps,netTx=s.network_tx_bps;document.getElementById('cards').innerHTML=card('CPU 平均',fmt(cpu.avg,0)+'%',`峰值 ${fmt(cpu.max,0)}%`)+card('GPU 平均',fmt(gpu.avg,0)+'%',`峰值 ${fmt(gpu.max,0)}%`)+card('内存平均',fmt(gb(mem.avg))+' GB',`峰值 ${fmt(gb(mem.max))} GB`)+card('GPU 最高温度',fmt(temp.max,0)+'°C',`平均 ${fmt(temp.avg,0)}°C`)+card('网络平均',`↓ ${fmt(mbps(netRx.avg))} MB/s`,`↑ ${fmt(mbps(netTx.avg))} MB/s`);document.getElementById('subtitle').textContent=`${range.count} 个有效样本 · 最后采集 ${range.last_at?new Date(range.last_at*1000).toLocaleString():'暂无'}`;draw('util',q.timestamps,[{name:'CPU',values:q.cpu_percent},{name:'GPU（最高）',values:q.gpu_percent}],'%',100);draw('memory',q.timestamps,[{name:'内存 GB',values:q.memory_used_bytes.map(gb)},{name:'显存合计 GB',values:q.gpu_memory_used_bytes.map(gb)}],' GB');draw('thermal',q.timestamps,[{name:'最高温度 °C',values:q.gpu_temperature},{name:'功耗合计 W',values:q.gpu_power_watts}],'');draw('network',q.timestamps,[{name:'下载 MB/s',values:q.network_rx_bps.map(mbps)},{name:'上传 MB/s',values:q.network_tx_bps.map(mbps)}],' MB/s')}
-document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>render(b.dataset.range));window.onresize=()=>render(document.querySelector('.tabs button.active').dataset.range);document.getElementById('footer').textContent=`报告生成于 ${new Date(DATA.generated_at*1000).toLocaleString()} · 数据仅保存在本机`;render('day');
+function tooltipFor(box){let tip=box.querySelector('.tooltip');if(!tip){tip=document.createElement('div');tip.className='tooltip';tip.setAttribute('role','status');box.appendChild(tip)}return tip}
+function draw(id,timestamps,lines,unit,fixedMax=null,hoverIndex=null){
+ const canvas=document.getElementById(id),box=canvas.parentElement,tip=tooltipFor(box),dpr=devicePixelRatio||1,w=box.clientWidth,h=box.clientHeight;
+ canvas.width=w*dpr;canvas.height=h*dpr;const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);
+ const values=lines.flatMap(x=>x.values).filter(finite);
+ if(!timestamps.length||!values.length){tip.style.display='none';c.fillStyle='#91a0ba';c.textAlign='center';c.fillText('暂无数据',w/2,h/2);return}
+ const pad={l:45,r:14,t:24,b:30},cw=w-pad.l-pad.r,ch=h-pad.t-pad.b,min=0,max=fixedMax||Math.max(...values)*1.12||1;
+ const first=timestamps[0],last=timestamps[timestamps.length-1]||first+1,span=Math.max(1,last-first);
+ const pointX=i=>pad.l+cw*((timestamps[i]-first)/span),pointY=v=>pad.t+ch*(1-(v-min)/Math.max(1,max-min));
+ c.strokeStyle='#26324b';c.fillStyle='#91a0ba';c.font='11px -apple-system';c.textAlign='right';
+ for(let i=0;i<=4;i++){const y=pad.t+ch*i/4;c.beginPath();c.moveTo(pad.l,y);c.lineTo(w-pad.r,y);c.stroke();c.fillText(fmt(max*(1-i/4),max<10?1:0)+unit,pad.l-7,y+4)}
+ lines.forEach((line,index)=>{c.strokeStyle=colors[index];c.lineWidth=2;c.beginPath();let started=false;line.values.forEach((v,i)=>{if(!finite(v))return;const x=pointX(i),y=pointY(v);started?c.lineTo(x,y):c.moveTo(x,y);started=true});c.stroke();line.values.forEach((v,i)=>{if(!finite(v))return;c.beginPath();c.fillStyle=colors[index];c.arc(pointX(i),pointY(v),i===hoverIndex?4:1.7,0,Math.PI*2);c.fill()});c.fillStyle=colors[index];c.textAlign='left';c.fillText(line.name,pad.l+index*110,13)});
+ if(hoverIndex!==null){const x=pointX(hoverIndex);c.strokeStyle='#b9c8df99';c.lineWidth=1;c.beginPath();c.moveTo(x,pad.t);c.lineTo(x,pad.t+ch);c.stroke()}
+ c.fillStyle='#91a0ba';c.textAlign='left';c.fillText(new Date(first*1000).toLocaleString(),pad.l,h-8);c.textAlign='right';c.fillText(new Date(last*1000).toLocaleString(),w-pad.r,h-8);
+ canvas.onmousemove=event=>{const rect=canvas.getBoundingClientRect(),mouseX=event.clientX-rect.left;if(mouseX<pad.l||mouseX>w-pad.r){tip.style.display='none';if(hoverIndex!==null)draw(id,timestamps,lines,unit,fixedMax,null);return}let nearest=null,distance=Infinity;timestamps.forEach((_,i)=>{if(!lines.some(line=>finite(line.values[i])))return;const delta=Math.abs(pointX(i)-mouseX);if(delta<distance){distance=delta;nearest=i}});if(nearest===null)return;draw(id,timestamps,lines,unit,fixedMax,nearest);const rows=lines.map((line,index)=>({line,index})).filter(item=>finite(item.line.values[nearest])).map(item=>`<div class="tooltip-row"><span class="tooltip-label"><span class="tooltip-dot" style="background:${colors[item.index]}"></span>${item.line.name}</span><strong>${fmt(item.line.values[nearest],Math.abs(item.line.values[nearest])<10?2:1)}${unit}</strong></div>`).join('');tip.innerHTML=`<div class="tooltip-time">${new Date(timestamps[nearest]*1000).toLocaleString([], {hour12:false})}</div>${rows}`;tip.style.display='block';const x=pointX(nearest),left=x+14+tip.offsetWidth>w?x-tip.offsetWidth-10:x+10;tip.style.left=`${Math.max(4,left)}px`;tip.style.top=`${Math.max(26,Math.min(h-tip.offsetHeight-6,event.clientY-rect.top-12))}px`};
+ canvas.onmouseleave=()=>{tip.style.display='none';if(hoverIndex!==null)draw(id,timestamps,lines,unit,fixedMax,null)};
+}
+function render(key){
+ const range=DATA.ranges[key],s=range.stats,q=range.series;document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active',b.dataset.range===key));
+ const cpu=s.cpu_percent,gpu=s.gpu_percent,mem=s.memory_used_bytes,temp=s.gpu_temperature,netRx=s.network_rx_bps,netTx=s.network_tx_bps;
+ document.getElementById('cards').innerHTML=card('CPU 平均',fmt(cpu.avg,0)+'%',`峰值 ${fmt(cpu.max,0)}%`)+card('GPU 平均',fmt(gpu.avg,0)+'%',`峰值 ${fmt(gpu.max,0)}%`)+card('内存平均',fmt(gb(mem.avg))+' GB',`峰值 ${fmt(gb(mem.max))} GB`)+card('GPU 最高温度',fmt(temp.max,0)+'°C',`平均 ${fmt(temp.avg,0)}°C`)+card('网络平均',`↓ ${fmt(mbps(netRx.avg))} MB/s`,`↑ ${fmt(mbps(netTx.avg))} MB/s`);
+ document.getElementById('subtitle').textContent=`${range.count} 个有效样本 · 最后采集 ${range.last_at?new Date(range.last_at*1000).toLocaleString():'暂无'}`;
+ draw('util',q.timestamps,[{name:'CPU',values:q.cpu_percent},{name:'GPU（最高）',values:q.gpu_percent}],'%',100);
+ draw('memory',q.timestamps,[{name:'内存 GB',values:q.memory_used_bytes.map(gb)},{name:'显存合计 GB',values:q.gpu_memory_used_bytes.map(gb)}],' GB');
+ draw('thermal',q.timestamps,[{name:'最高温度 °C',values:q.gpu_temperature},{name:'功耗合计 W',values:q.gpu_power_watts}],'');
+ draw('network',q.timestamps,[{name:'下载 MB/s',values:q.network_rx_bps.map(mbps)},{name:'上传 MB/s',values:q.network_tx_bps.map(mbps)}],' MB/s');
+}
+document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>render(b.dataset.range));
+window.onresize=()=>render(document.querySelector('.tabs button.active').dataset.range);
+document.getElementById('footer').textContent=`报告生成于 ${new Date(DATA.generated_at*1000).toLocaleString()} · 数据仅保存在本机`;
+render('day');
 </script></body></html>'''
 
 
 def write_history_report(history_path: Path, report_path: Path, now: float) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(str(history_path), timeout=5) as database:
+    with closing(sqlite3.connect(str(history_path), timeout=5)) as database:
         payload = {
             "generated_at": now,
             "ranges": {
