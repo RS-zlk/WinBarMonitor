@@ -54,6 +54,30 @@ class ParserTests(unittest.TestCase):
         self.assertIn("🎮 GPU 1 · GPU A", rendered)
         self.assertIn("🎮 GPU 2 · GPU B", rendered)
 
+    def test_menu_bar_display_modes_and_chinese_settings_menu(self):
+        metrics = wm.normalize_metrics({
+            "cpu_percent": 12,
+            "network_rx_bps": 2 * 1024 ** 2,
+            "gpus": [{"utilization_gpu": 84, "memory_used": 2048, "memory_total": 8192,
+                      "temperature": 56, "power_draw": 145}],
+        })
+        self.assertIn("GPU 84%", wm._menu_bar_line(metrics, "gpu"))
+        self.assertIn("CPU 12%", wm._menu_bar_line(metrics, "cpu"))
+        self.assertIn("显存 2.0 GB / 8.0 GB", wm._menu_bar_line(metrics, "vram"))
+        self.assertNotIn("🟢", wm._menu_bar_line(metrics, "gpu"))
+        self.assertNotIn("🖥", wm._menu_bar_line(metrics, "gpu"))
+        self.assertIn("GPU 56°C", wm._menu_bar_line(metrics, "temperature"))
+        self.assertIn("GPU 145 W", wm._menu_bar_line(metrics, "power"))
+        self.assertIn("网络下载速率", wm._display_settings_menu(Path("/tmp/settings.json"), "gpu")[7])
+        self.assertIn("⚙️ 菜单栏显示设置", wm.render(metrics, menu_bar_mode="gpu"))
+
+    def test_menu_bar_mode_is_saved_locally(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings_path = Path(folder) / "settings.json"
+            self.assertEqual(wm.cli_main(["--set-menu-bar-mode", "power", "--settings-path", str(settings_path)]), 0)
+            self.assertEqual(wm._read_settings(settings_path), {"menu_bar_mode": "power"})
+            self.assertEqual(wm.cli_main(["--set-menu-bar-mode", "not-a-mode"]), 1)
+
     def test_normalize_na_fixture(self):
         raw = json.loads((ROOT / "na_gpu.json").read_text())
         result = wm.normalize_metrics(raw)
@@ -176,11 +200,20 @@ class HistoryTests(unittest.TestCase):
             report = report_path.read_text(encoding="utf-8")
             self.assertIn("WinBarMonitor 实时概览", report)
             self.assertIn('"count":1', report)
+            self.assertIn('"twoHours":{"series"', report)
+            self.assertIn('"bucket_seconds":60', report)
+            self.assertIn('"bucket_seconds":300', report)
+            self.assertIn('data-range="twoHours" class="active">2 小时', report)
+            self.assertIn("render('twoHours');", report)
             self.assertIn('id="current-cards"', report)
             self.assertIn("<canvas id=\"util\"", report)
             self.assertIn("className='tooltip'", report)
             self.assertIn("canvas.onmousemove", report)
             self.assertIn("tooltip-time", report)
+            self.assertIn("hasTimeGap", report)
+            self.assertIn("started=false", report)
+            self.assertIn("fixedMax,nearest,gapSeconds", report)
+            self.assertIn("fixedMax,null,gapSeconds", report)
             self.assertNotIn("https://", report)
 
     def test_history_aggregates_multiple_gpus(self):

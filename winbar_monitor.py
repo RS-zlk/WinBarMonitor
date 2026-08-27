@@ -16,6 +16,7 @@ import shlex
 import sqlite3
 import struct
 import subprocess
+import sys
 import time
 import zlib
 from contextlib import closing
@@ -30,8 +31,15 @@ DEFAULT_SSH_TIMEOUT = 15
 DEFAULT_CACHE_PATH = Path.home() / ".cache" / "winbar-monitor" / "cache.json"
 DEFAULT_HISTORY_PATH = Path.home() / ".local" / "share" / "winbar-monitor" / "history.sqlite3"
 DEFAULT_REPORT_PATH = Path.home() / ".local" / "share" / "winbar-monitor" / "history.html"
+DEFAULT_SETTINGS_PATH = Path.home() / ".local" / "share" / "winbar-monitor" / "settings.json"
 DEFAULT_RETENTION_DAYS = 30
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_name(".winbar.env")
+MENU_BAR_MODES = ("auto", "gpu", "cpu", "vram", "temperature", "power", "network")
+MENU_BAR_MODE_LABELS = {
+    "auto": "智能概览（优先 GPU）", "gpu": "GPU 利用率", "cpu": "CPU 利用率",
+    "vram": "显存占用", "temperature": "GPU 温度", "power": "GPU 功耗",
+    "network": "网络下载速率",
+}
 
 
 POWERSHELL_SCRIPT = r'''
@@ -87,6 +95,8 @@ class Config:
     history_path: Path = DEFAULT_HISTORY_PATH
     report_path: Path = DEFAULT_REPORT_PATH
     retention_days: int = DEFAULT_RETENTION_DAYS
+    settings_path: Path = DEFAULT_SETTINGS_PATH
+    menu_bar_mode: str = "auto"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -106,6 +116,11 @@ class Config:
         cache_path = value("WINBAR_CACHE_PATH", None)
         history_path = value("WINBAR_HISTORY_PATH", None)
         report_path = value("WINBAR_REPORT_PATH", None)
+        settings_path = value("WINBAR_SETTINGS_PATH", None)
+        resolved_settings_path = Path(settings_path).expanduser() if settings_path else DEFAULT_SETTINGS_PATH
+        saved_settings = _read_settings(resolved_settings_path)
+        menu_bar_mode = str(os.environ.get("WINBAR_MENU_BAR_MODE", saved_settings.get(
+            "menu_bar_mode", local.get("WINBAR_MENU_BAR_MODE", cls.menu_bar_mode))))
         return cls(
             ssh_alias=str(value("WINBAR_SSH_ALIAS", cls.ssh_alias)),
             refresh_seconds=positive_int("WINBAR_REFRESH_SECONDS", DEFAULT_REFRESH_SECONDS),
@@ -114,6 +129,8 @@ class Config:
             history_path=Path(history_path).expanduser() if history_path else DEFAULT_HISTORY_PATH,
             report_path=Path(report_path).expanduser() if report_path else DEFAULT_REPORT_PATH,
             retention_days=positive_int("WINBAR_RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
+            settings_path=resolved_settings_path,
+            menu_bar_mode=menu_bar_mode if menu_bar_mode in MENU_BAR_MODES else cls.menu_bar_mode,
         )
 
 
@@ -142,6 +159,37 @@ def _read_env_file(path: Path) -> dict[str, str]:
             continue
         result[name] = parts[0] if parts else ""
     return result
+
+
+def _read_settings(path: Path) -> dict[str, Any]:
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def save_menu_bar_mode(path: Path, mode: str) -> None:
+    """Save a user-selected display mode without modifying source configuration."""
+    if mode not in MENU_BAR_MODES:
+        raise ValueError(f"未知的菜单栏显示模式：{mode}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps({"menu_bar_mode": mode}, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+    path.chmod(0o600)
+
+
+def _refresh_installed_plugin() -> None:
+    """Notify SwiftBar immediately after a display-setting change."""
+    library_dir = Path(__file__).resolve().parent
+    if library_dir.name != ".winbar_lib":
+        return
+    for plugin_path in library_dir.parent.glob("winbar.*s.py"):
+        try:
+            plugin_path.touch()
+        except OSError:
+            pass
 
 
 def _number(value: Any) -> float | None:
@@ -349,7 +397,15 @@ def _query_report_range(database: sqlite3.Connection, now: float, seconds: int,
         "SELECT COUNT(*), MIN(collected_at), MAX(collected_at) FROM samples WHERE collected_at >= ?",
         (cutoff,),
     ).fetchone()
-    return {"series": series, "stats": stats, "count": count, "first_at": first_at, "last_at": last_at}
+    return {
+        "series": series,
+        "stats": stats,
+        "count": count,
+        "first_at": first_at,
+        "last_at": last_at,
+        # The browser uses this to leave gaps when whole collection buckets are missing.
+        "bucket_seconds": bucket_seconds,
+    }
 
 
 REPORT_TEMPLATE = r'''<!doctype html>
@@ -372,7 +428,7 @@ footer{color:var(--muted);margin-top:20px;font-size:12px}@media(max-width:850px)
 <header><div><h1>WinBarMonitor 实时概览</h1><div class="sub" id="subtitle"></div></div></header>
 <section class="cards" id="current-cards"></section>
 <h2 class="section-title">历史趋势</h2><div class="hint">移动鼠标到曲线节点，可查看该时间点的数值。</div>
-<div class="tabs"><button data-range="day" class="active">24 小时</button><button data-range="week">7 天</button><button data-range="month">30 天</button></div>
+<div class="tabs"><button data-range="twoHours" class="active">2 小时</button><button data-range="day">24 小时</button><button data-range="week">7 天</button><button data-range="month">30 天</button></div>
 <section class="cards" id="cards"></section>
 <section class="charts">
 <div class="chart"><h2>CPU / GPU 利用率</h2><div class="canvas-wrap"><canvas id="util"></canvas></div></div>
@@ -398,7 +454,7 @@ function currentCards(){
  document.getElementById('current-cards').innerHTML=card('主机',m.hostname||'Windows PC',DATA.current.collected_at?`更新于 ${new Date(DATA.current.collected_at*1000).toLocaleString()}`:'')+card('CPU',fmt(m.cpu_percent,0)+'%',`内存 ${fmt(gb(memUsed))} / ${fmt(gb(m.memory_total_bytes))} GB`)+card('磁盘 C:',`${fmt(gb(diskUsed))} / ${fmt(gb(m.disk_total_bytes))} GB`,'已用 / 总容量')+card('GPU',fmt(gpu.utilization_gpu,0)+'%',`显存 ${gpuMem} · ${fmt(gpu.temperature,0)}°C`)+card('网络',`↓ ${fmt(mbps(m.network_rx_bps))} MB/s`,`↑ ${fmt(mbps(m.network_tx_bps))} MB/s`);
 }
 function tooltipFor(box){let tip=box.querySelector('.tooltip');if(!tip){tip=document.createElement('div');tip.className='tooltip';tip.setAttribute('role','status');box.appendChild(tip)}return tip}
-function draw(id,timestamps,lines,unit,fixedMax=null,hoverIndex=null){
+function draw(id,timestamps,lines,unit,fixedMax=null,hoverIndex=null,gapSeconds=0){
  const canvas=document.getElementById(id),box=canvas.parentElement,tip=tooltipFor(box),dpr=devicePixelRatio||1,w=box.clientWidth,h=box.clientHeight;
  canvas.width=w*dpr;canvas.height=h*dpr;const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);
  const values=lines.flatMap(x=>x.values).filter(finite);
@@ -408,27 +464,27 @@ function draw(id,timestamps,lines,unit,fixedMax=null,hoverIndex=null){
  const pointX=i=>pad.l+cw*((timestamps[i]-first)/span),pointY=v=>pad.t+ch*(1-(v-min)/Math.max(1,max-min));
  c.strokeStyle='#26324b';c.fillStyle='#91a0ba';c.font='11px -apple-system';c.textAlign='right';
  for(let i=0;i<=4;i++){const y=pad.t+ch*i/4;c.beginPath();c.moveTo(pad.l,y);c.lineTo(w-pad.r,y);c.stroke();c.fillText(fmt(max*(1-i/4),max<10?1:0)+unit,pad.l-7,y+4)}
- lines.forEach((line,index)=>{c.strokeStyle=colors[index];c.lineWidth=2;c.beginPath();let started=false;line.values.forEach((v,i)=>{if(!finite(v))return;const x=pointX(i),y=pointY(v);started?c.lineTo(x,y):c.moveTo(x,y);started=true});c.stroke();line.values.forEach((v,i)=>{if(!finite(v))return;c.beginPath();c.fillStyle=colors[index];c.arc(pointX(i),pointY(v),i===hoverIndex?4:1.7,0,Math.PI*2);c.fill()});c.fillStyle=colors[index];c.textAlign='left';c.fillText(line.name,pad.l+index*110,13)});
+ lines.forEach((line,index)=>{c.strokeStyle=colors[index];c.lineWidth=2;c.beginPath();let started=false;line.values.forEach((v,i)=>{const previous=timestamps[i-1];const hasTimeGap=i>0&&gapSeconds>0&&timestamps[i]-previous>gapSeconds*1.5;if(!finite(v)||hasTimeGap){started=false;if(!finite(v))return}const x=pointX(i),y=pointY(v);started?c.lineTo(x,y):c.moveTo(x,y);started=true});c.stroke();line.values.forEach((v,i)=>{if(!finite(v))return;c.beginPath();c.fillStyle=colors[index];c.arc(pointX(i),pointY(v),i===hoverIndex?4:1.7,0,Math.PI*2);c.fill()});c.fillStyle=colors[index];c.textAlign='left';c.fillText(line.name,pad.l+index*110,13)});
  if(hoverIndex!==null){const x=pointX(hoverIndex);c.strokeStyle='#b9c8df99';c.lineWidth=1;c.beginPath();c.moveTo(x,pad.t);c.lineTo(x,pad.t+ch);c.stroke()}
  c.fillStyle='#91a0ba';c.textAlign='left';c.fillText(new Date(first*1000).toLocaleString(),pad.l,h-8);c.textAlign='right';c.fillText(new Date(last*1000).toLocaleString(),w-pad.r,h-8);
- canvas.onmousemove=event=>{const rect=canvas.getBoundingClientRect(),mouseX=event.clientX-rect.left;if(mouseX<pad.l||mouseX>w-pad.r){tip.style.display='none';if(hoverIndex!==null)draw(id,timestamps,lines,unit,fixedMax,null);return}let nearest=null,distance=Infinity;timestamps.forEach((_,i)=>{if(!lines.some(line=>finite(line.values[i])))return;const delta=Math.abs(pointX(i)-mouseX);if(delta<distance){distance=delta;nearest=i}});if(nearest===null)return;draw(id,timestamps,lines,unit,fixedMax,nearest);const rows=lines.map((line,index)=>({line,index})).filter(item=>finite(item.line.values[nearest])).map(item=>`<div class="tooltip-row"><span class="tooltip-label"><span class="tooltip-dot" style="background:${colors[item.index]}"></span>${item.line.name}</span><strong>${fmt(item.line.values[nearest],Math.abs(item.line.values[nearest])<10?2:1)}${unit}</strong></div>`).join('');tip.innerHTML=`<div class="tooltip-time">${new Date(timestamps[nearest]*1000).toLocaleString([], {hour12:false})}</div>${rows}`;tip.style.display='block';const x=pointX(nearest),left=x+14+tip.offsetWidth>w?x-tip.offsetWidth-10:x+10;tip.style.left=`${Math.max(4,left)}px`;tip.style.top=`${Math.max(26,Math.min(h-tip.offsetHeight-6,event.clientY-rect.top-12))}px`};
- canvas.onmouseleave=()=>{tip.style.display='none';if(hoverIndex!==null)draw(id,timestamps,lines,unit,fixedMax,null)};
+ canvas.onmousemove=event=>{const rect=canvas.getBoundingClientRect(),mouseX=event.clientX-rect.left;if(mouseX<pad.l||mouseX>w-pad.r){tip.style.display='none';if(hoverIndex!==null)draw(id,timestamps,lines,unit,fixedMax,null,gapSeconds);return}let nearest=null,distance=Infinity;timestamps.forEach((_,i)=>{if(!lines.some(line=>finite(line.values[i])))return;const delta=Math.abs(pointX(i)-mouseX);if(delta<distance){distance=delta;nearest=i}});if(nearest===null)return;draw(id,timestamps,lines,unit,fixedMax,nearest,gapSeconds);const rows=lines.map((line,index)=>({line,index})).filter(item=>finite(item.line.values[nearest])).map(item=>`<div class="tooltip-row"><span class="tooltip-label"><span class="tooltip-dot" style="background:${colors[item.index]}"></span>${item.line.name}</span><strong>${fmt(item.line.values[nearest],Math.abs(item.line.values[nearest])<10?2:1)}${unit}</strong></div>`).join('');tip.innerHTML=`<div class="tooltip-time">${new Date(timestamps[nearest]*1000).toLocaleString([], {hour12:false})}</div>${rows}`;tip.style.display='block';const x=pointX(nearest),left=x+14+tip.offsetWidth>w?x-tip.offsetWidth-10:x+10;tip.style.left=`${Math.max(4,left)}px`;tip.style.top=`${Math.max(26,Math.min(h-tip.offsetHeight-6,event.clientY-rect.top-12))}px`};
+ canvas.onmouseleave=()=>{tip.style.display='none';if(hoverIndex!==null)draw(id,timestamps,lines,unit,fixedMax,null,gapSeconds)};
 }
 function render(key){
  const range=DATA.ranges[key],s=range.stats,q=range.series;document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('active',b.dataset.range===key));
  const cpu=s.cpu_percent,gpu=s.gpu_percent,mem=s.memory_used_bytes,temp=s.gpu_temperature,netRx=s.network_rx_bps,netTx=s.network_tx_bps;
  document.getElementById('cards').innerHTML=card('CPU 平均',fmt(cpu.avg,0)+'%',`峰值 ${fmt(cpu.max,0)}%`)+card('GPU 平均',fmt(gpu.avg,0)+'%',`峰值 ${fmt(gpu.max,0)}%`)+card('内存平均',fmt(gb(mem.avg))+' GB',`峰值 ${fmt(gb(mem.max))} GB`)+card('GPU 最高温度',fmt(temp.max,0)+'°C',`平均 ${fmt(temp.avg,0)}°C`)+card('网络平均',`↓ ${fmt(mbps(netRx.avg))} MB/s`,`↑ ${fmt(mbps(netTx.avg))} MB/s`);
  document.getElementById('subtitle').textContent=`${range.count} 个有效样本 · 最后采集 ${range.last_at?new Date(range.last_at*1000).toLocaleString():'暂无'}`;
- draw('util',q.timestamps,[{name:'CPU',values:q.cpu_percent},{name:'GPU（最高）',values:q.gpu_percent}],'%',100);
- draw('memory',q.timestamps,[{name:'内存 GB',values:q.memory_used_bytes.map(gb)},{name:'显存合计 GB',values:q.gpu_memory_used_bytes.map(gb)}],' GB');
- draw('thermal',q.timestamps,[{name:'最高温度 °C',values:q.gpu_temperature},{name:'功耗合计 W',values:q.gpu_power_watts}],'');
- draw('network',q.timestamps,[{name:'下载 MB/s',values:q.network_rx_bps.map(mbps)},{name:'上传 MB/s',values:q.network_tx_bps.map(mbps)}],' MB/s');
+ draw('util',q.timestamps,[{name:'CPU',values:q.cpu_percent},{name:'GPU（最高）',values:q.gpu_percent}],'%',100,null,range.bucket_seconds);
+ draw('memory',q.timestamps,[{name:'内存 GB',values:q.memory_used_bytes.map(gb)},{name:'显存合计 GB',values:q.gpu_memory_used_bytes.map(gb)}],' GB',null,null,range.bucket_seconds);
+ draw('thermal',q.timestamps,[{name:'最高温度 °C',values:q.gpu_temperature},{name:'功耗合计 W',values:q.gpu_power_watts}],'',null,null,range.bucket_seconds);
+ draw('network',q.timestamps,[{name:'下载 MB/s',values:q.network_rx_bps.map(mbps)},{name:'上传 MB/s',values:q.network_tx_bps.map(mbps)}],' MB/s',null,null,range.bucket_seconds);
 }
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>render(b.dataset.range));
 window.onresize=()=>render(document.querySelector('.tabs button.active').dataset.range);
 document.getElementById('footer').textContent=`报告生成于 ${new Date(DATA.generated_at*1000).toLocaleString()} · 数据仅保存在本机`;
 currentCards();
-render('day');
+render('twoHours');
 </script></body></html>'''
 
 
@@ -440,6 +496,7 @@ def write_history_report(history_path: Path, report_path: Path, now: float,
             "generated_at": now,
             "current": {"collected_at": now, "metrics": metrics} if metrics else None,
             "ranges": {
+                "twoHours": _query_report_range(database, now, 2 * 3600, 60),
                 "day": _query_report_range(database, now, 86400, 300),
                 "week": _query_report_range(database, now, 7 * 86400, 3600),
                 "month": _query_report_range(database, now, 30 * 86400, 21600),
@@ -535,6 +592,41 @@ def _history_action(report_path: Path) -> str:
     return f"📊 查看历史统计 | bash=/usr/bin/open param1={quoted_path} terminal=false"
 
 
+def _menu_bar_line(metrics: dict[str, Any], mode: str, *, stale: bool = False) -> str:
+    """Return the SwiftBar title line for the selected, compact metric."""
+    gpu = (metrics.get("gpus") or [{}])[0]
+    gpu_util = _percent(gpu.get("utilization_gpu"))
+    temperature = _number(gpu.get("temperature"))
+    power_draw = _number(gpu.get("power_draw"))
+    values = {
+        "gpu": f"GPU {gpu_util}",
+        "cpu": f"CPU {_percent(metrics.get('cpu_percent'))}",
+        "vram": "显存 " + (
+            f"{_fmt_bytes(gpu.get('memory_used') * 1024 ** 2)} / {_fmt_bytes(gpu.get('memory_total') * 1024 ** 2)}"
+            if gpu.get("memory_used") is not None and gpu.get("memory_total") is not None else "N/A"),
+        "temperature": f"GPU {temperature:.0f}°C" if temperature is not None else "GPU N/A",
+        "power": f"GPU {power_draw:.0f} W" if power_draw is not None else "GPU N/A",
+        "network": f"↓ {_fmt_rate(metrics.get('network_rx_bps'))}",
+    }
+    selected = "gpu" if mode == "auto" and gpu.get("utilization_gpu") is not None else ("cpu" if mode == "auto" else mode)
+    return f"{values[selected]}{_menu_icon('yellow' if stale else 'green')}"
+
+
+def _display_mode_action(label: str, mode: str, settings_path: Path, *, selected: bool) -> str:
+    script = json.dumps(str(Path(__file__).resolve()), ensure_ascii=False)
+    settings = json.dumps(str(settings_path), ensure_ascii=False)
+    prefix = "✓ " if selected else ""
+    return (f"{prefix}{label} | bash=/usr/bin/env param1=python3 param2={script} "
+            f"param3=--set-menu-bar-mode param4={mode} param5=--settings-path param6={settings} terminal=false refresh=true")
+
+
+def _display_settings_menu(settings_path: Path, current_mode: str) -> list[str]:
+    return ["⚙️ 菜单栏显示设置", *[
+        "--" + _display_mode_action(label, mode, settings_path, selected=mode == current_mode)
+        for mode, label in MENU_BAR_MODE_LABELS.items()
+    ]]
+
+
 def _details_action(label: str, report_path: Path) -> str:
     """Make a read-only metric a high-contrast, meaningful SwiftBar menu item."""
     quoted_path = json.dumps(str(report_path), ensure_ascii=False)
@@ -563,7 +655,8 @@ def _uptime(last_boot: Any, now: float | None = None) -> str:
 
 def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = None,
            collected_at: float | None = None, report_path: Path = DEFAULT_REPORT_PATH,
-           ssh_alias: str | None = None, plugin_name: str = "winbar.1m.py") -> str:
+           ssh_alias: str | None = None, plugin_name: str = "winbar.1m.py",
+           menu_bar_mode: str = "auto", settings_path: Path = DEFAULT_SETTINGS_PATH) -> str:
     gpu = (metrics.get("gpus") or [{}])[0]
     cpu = _percent(metrics.get("cpu_percent"))
     gpu_util = _percent(gpu.get("utilization_gpu"))
@@ -578,7 +671,7 @@ def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = 
     alias = (ssh_alias if ssh_alias is not None else Config.from_env().ssh_alias).strip()
     host_label = hostname or alias or "Windows PC"
     detail = lambda label: _details_action(label, report_path)
-    lines = [_menu_icon(icon_color), "---", detail(summary), "---",
+    lines = [_menu_bar_line(metrics, menu_bar_mode, stale=stale), "---", detail(summary), "---",
              detail("ⓘ 点击任一指标查看实时详情与历史趋势"),
              detail(f"🖥️ {host_label}"), detail(f"CPU 占用 · {cpu}"),
              detail(f"内存 · {_fmt_bytes(metrics.get('memory_total_bytes') - metrics.get('memory_free_bytes')) if metrics.get('memory_total_bytes') is not None and metrics.get('memory_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('memory_total_bytes'))}"),
@@ -605,7 +698,7 @@ def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = 
     if collected_at:
         timestamp = datetime.fromtimestamp(collected_at).astimezone().strftime("%Y-%m-%d %H:%M:%S")
         lines.append(f"---\n{detail(f'🕒 {timestamp}')}")
-    lines.extend(["---", _history_action(report_path), "🔄 手动刷新 | refresh=true",
+    lines.extend(["---", *_display_settings_menu(settings_path, menu_bar_mode), "---", _history_action(report_path), "🔄 手动刷新 | refresh=true",
                   f"🔐 打开 SSH | bash=/usr/bin/ssh param1={alias} terminal=true"])
     return "\n".join(lines)
 
@@ -624,17 +717,42 @@ def main() -> int:
         except (OSError, ValueError, sqlite3.Error) as exc:
             history_error = f"历史记录失败：{exc}"
         print(render(metrics, error=history_error, collected_at=collected_at,
-                     report_path=config.report_path, ssh_alias=config.ssh_alias))
+                     report_path=config.report_path, ssh_alias=config.ssh_alias,
+                     menu_bar_mode=config.menu_bar_mode, settings_path=config.settings_path))
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
         if cached:
             print(render(normalize_metrics(cached), stale=True, error=f"连接失败：{exc}",
                          collected_at=cached_at, report_path=config.report_path,
-                         ssh_alias=config.ssh_alias))
+                         ssh_alias=config.ssh_alias, menu_bar_mode=config.menu_bar_mode,
+                         settings_path=config.settings_path))
         else:
             print(f"{_menu_icon('red')}\n---\n🔴 离线 · Windows\n---\n⚠️ {exc}\n---\n"
                   f"{_history_action(config.report_path)}\n🔄 手动刷新 | refresh=true")
     return 0
 
 
+def cli_main(arguments: list[str]) -> int:
+    """Handle the small, local-only settings command used by the SwiftBar menu."""
+    if not arguments:
+        return main()
+    if arguments[0] != "--set-menu-bar-mode" or len(arguments) not in (2, 4):
+        print("用法：--set-menu-bar-mode <模式> [--settings-path <路径>]", file=sys.stderr)
+        return 2
+    mode = arguments[1]
+    settings_path = DEFAULT_SETTINGS_PATH
+    if len(arguments) == 4:
+        if arguments[2] != "--settings-path":
+            print("用法：--set-menu-bar-mode <模式> [--settings-path <路径>]", file=sys.stderr)
+            return 2
+        settings_path = Path(arguments[3]).expanduser()
+    try:
+        save_menu_bar_mode(settings_path, mode)
+        _refresh_installed_plugin()
+    except (OSError, ValueError) as exc:
+        print(f"保存设置失败：{exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli_main(sys.argv[1:]))
