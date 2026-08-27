@@ -202,6 +202,11 @@ class HistoryTests(unittest.TestCase):
 
 
 class RuntimeCompatibilityTests(unittest.TestCase):
+    def test_plugin_does_not_refresh_on_open(self):
+        project_root = Path(__file__).resolve().parents[1]
+        plugin = (project_root / "winbar.1m.py").read_text(encoding="utf-8")
+        self.assertNotIn("swiftbar.refreshOnOpen", plugin)
+
     def test_macos_system_python_can_compile_plugin(self):
         interpreter = Path("/usr/bin/python3")
         if not interpreter.exists():

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# <swiftbar.refreshOnOpen>true</swiftbar.refreshOnOpen>
 from pathlib import Path
 import sys
 
