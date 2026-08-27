@@ -357,11 +357,11 @@ REPORT_TEMPLATE = r'''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WinBarMonitor 历史统计</title>
+<title>WinBarMonitor 实时概览与历史统计</title>
 <style>
-:root{color-scheme:dark;--bg:#0b1020;--muted:#91a0ba;--text:#edf3ff;--line:#26324b;--blue:#5aa7ff;--green:#54d69b;--orange:#ffb454;--pink:#ed75b8}
+:root{color-scheme:dark;--bg:#080d18;--muted:#b8c5da;--text:#f7faff;--line:#344563;--blue:#6bb2ff;--green:#65e5a7;--orange:#ffc36b;--pink:#f38bc8}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#18264a 0,transparent 38%),var(--bg);color:var(--text);font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1180px;margin:auto;padding:32px 22px 48px}header{display:flex;gap:18px;align-items:end;justify-content:space-between;margin-bottom:24px}h1{font-size:28px;margin:0 0 6px}.sub{color:var(--muted)}
+main{max-width:1180px;margin:auto;padding:32px 22px 48px}header{display:flex;gap:18px;align-items:end;justify-content:space-between;margin-bottom:24px}h1{font-size:28px;margin:0 0 6px}.sub{color:var(--muted)}h2.section-title{font-size:17px;margin:28px 0 12px}.hint{color:var(--muted);font-size:12px;margin:-5px 0 13px}
 .tabs{display:flex;gap:8px}.tabs button{border:1px solid var(--line);background:#10182a;color:var(--muted);border-radius:10px;padding:8px 14px;cursor:pointer}.tabs button.active{background:#284f85;color:#fff;border-color:#4b85c7}
 .cards{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin-bottom:18px}.card,.chart{background:linear-gradient(145deg,#171f34,#11182a);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 35px #0004}.card{padding:16px}.label{color:var(--muted);font-size:12px}.value{font-size:23px;font-weight:650;margin:7px 0}.detail{color:var(--muted);font-size:12px}
 .charts{display:grid;grid-template-columns:1fr 1fr;gap:14px}.chart{padding:16px}.chart h2{font-size:15px;margin:0 0 12px}.canvas-wrap{height:245px;position:relative}canvas{width:100%;height:100%;cursor:crosshair}.tooltip{position:absolute;display:none;z-index:2;pointer-events:none;min-width:170px;padding:10px 12px;border:1px solid #405170;border-radius:9px;background:#090e1beF;box-shadow:0 8px 24px #0008;color:var(--text);font-size:12px;line-height:1.5}.tooltip-time{margin-bottom:5px;color:#c9d7ef;font-weight:600}.tooltip-row{display:flex;align-items:center;justify-content:space-between;gap:18px}.tooltip-label{display:flex;align-items:center;gap:6px;color:var(--muted)}.tooltip-dot{width:7px;height:7px;border-radius:50%}
@@ -369,7 +369,10 @@ footer{color:var(--muted);margin-top:20px;font-size:12px}@media(max-width:850px)
 </style>
 </head>
 <body><main>
-<header><div><h1>WinBarMonitor 历史统计</h1><div class="sub" id="subtitle"></div></div><div class="tabs"><button data-range="day" class="active">24 小时</button><button data-range="week">7 天</button><button data-range="month">30 天</button></div></header>
+<header><div><h1>WinBarMonitor 实时概览</h1><div class="sub" id="subtitle"></div></div></header>
+<section class="cards" id="current-cards"></section>
+<h2 class="section-title">历史趋势</h2><div class="hint">移动鼠标到曲线节点，可查看该时间点的数值。</div>
+<div class="tabs"><button data-range="day" class="active">24 小时</button><button data-range="week">7 天</button><button data-range="month">30 天</button></div>
 <section class="cards" id="cards"></section>
 <section class="charts">
 <div class="chart"><h2>CPU / GPU 利用率</h2><div class="canvas-wrap"><canvas id="util"></canvas></div></div>
@@ -386,6 +389,14 @@ const fmt=(v,d=1)=>finite(v)?v.toFixed(d):'N/A';
 const gb=v=>finite(v)?v/1073741824:null;
 const mbps=v=>finite(v)?v/1048576:null;
 function card(label,value,detail){return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div><div class="detail">${detail}</div></div>`}
+function currentCards(){
+ const m=DATA.current?.metrics;if(!m){document.getElementById('current-cards').innerHTML=card('实时数据','暂无','等待下一次成功采集');return}
+ const memUsed=finite(m.memory_total_bytes)&&finite(m.memory_free_bytes)?m.memory_total_bytes-m.memory_free_bytes:null;
+ const diskUsed=finite(m.disk_total_bytes)&&finite(m.disk_free_bytes)?m.disk_total_bytes-m.disk_free_bytes:null;
+ const gpu=(m.gpus||[])[0]||{};
+ const gpuMem=finite(gpu.memory_used)&&finite(gpu.memory_total)?`${fmt(gpu.memory_used/1024)} / ${fmt(gpu.memory_total/1024)} GB`:'N/A';
+ document.getElementById('current-cards').innerHTML=card('主机',m.hostname||'Windows PC',DATA.current.collected_at?`更新于 ${new Date(DATA.current.collected_at*1000).toLocaleString()}`:'')+card('CPU',fmt(m.cpu_percent,0)+'%',`内存 ${fmt(gb(memUsed))} / ${fmt(gb(m.memory_total_bytes))} GB`)+card('磁盘 C:',`${fmt(gb(diskUsed))} / ${fmt(gb(m.disk_total_bytes))} GB`,'已用 / 总容量')+card('GPU',fmt(gpu.utilization_gpu,0)+'%',`显存 ${gpuMem} · ${fmt(gpu.temperature,0)}°C`)+card('网络',`↓ ${fmt(mbps(m.network_rx_bps))} MB/s`,`↑ ${fmt(mbps(m.network_tx_bps))} MB/s`);
+}
 function tooltipFor(box){let tip=box.querySelector('.tooltip');if(!tip){tip=document.createElement('div');tip.className='tooltip';tip.setAttribute('role','status');box.appendChild(tip)}return tip}
 function draw(id,timestamps,lines,unit,fixedMax=null,hoverIndex=null){
  const canvas=document.getElementById(id),box=canvas.parentElement,tip=tooltipFor(box),dpr=devicePixelRatio||1,w=box.clientWidth,h=box.clientHeight;
@@ -416,15 +427,18 @@ function render(key){
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>render(b.dataset.range));
 window.onresize=()=>render(document.querySelector('.tabs button.active').dataset.range);
 document.getElementById('footer').textContent=`报告生成于 ${new Date(DATA.generated_at*1000).toLocaleString()} · 数据仅保存在本机`;
+currentCards();
 render('day');
 </script></body></html>'''
 
 
-def write_history_report(history_path: Path, report_path: Path, now: float) -> None:
+def write_history_report(history_path: Path, report_path: Path, now: float,
+                         metrics: dict[str, Any] | None = None) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(str(history_path), timeout=5)) as database:
         payload = {
             "generated_at": now,
+            "current": {"collected_at": now, "metrics": metrics} if metrics else None,
             "ranges": {
                 "day": _query_report_range(database, now, 86400, 300),
                 "week": _query_report_range(database, now, 7 * 86400, 3600),
@@ -521,6 +535,12 @@ def _history_action(report_path: Path) -> str:
     return f"📊 查看历史统计 | bash=/usr/bin/open param1={quoted_path} terminal=false"
 
 
+def _details_action(label: str, report_path: Path) -> str:
+    """Make a read-only metric a high-contrast, meaningful SwiftBar menu item."""
+    quoted_path = json.dumps(str(report_path), ensure_ascii=False)
+    return f"{label} | bash=/usr/bin/open param1={quoted_path} terminal=false"
+
+
 def _uptime(last_boot: Any, now: float | None = None) -> str:
     if not last_boot:
         return "N/A"
@@ -557,30 +577,34 @@ def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = 
     hostname = str(metrics.get("hostname") or "").strip()
     alias = (ssh_alias if ssh_alias is not None else Config.from_env().ssh_alias).strip()
     host_label = hostname or alias or "Windows PC"
-    lines = [_menu_icon(icon_color), "---", summary, "---", f"🖥️ {host_label}",
-             f"CPU 占用 · {cpu}", f"内存 · {_fmt_bytes(metrics.get('memory_total_bytes') - metrics.get('memory_free_bytes')) if metrics.get('memory_total_bytes') is not None and metrics.get('memory_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('memory_total_bytes'))}",
-             f"C盘 · {_fmt_bytes(metrics.get('disk_total_bytes') - metrics.get('disk_free_bytes')) if metrics.get('disk_total_bytes') is not None and metrics.get('disk_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('disk_total_bytes'))}",
-             f"网络 · ↓ {_fmt_rate(metrics.get('network_rx_bps'))} · ↑ {_fmt_rate(metrics.get('network_tx_bps'))}",
-             f"运行时间 · {_uptime(metrics.get('last_boot'))}"]
+    detail = lambda label: _details_action(label, report_path)
+    lines = [_menu_icon(icon_color), "---", detail(summary), "---",
+             detail("ⓘ 点击任一指标查看实时详情与历史趋势"),
+             detail(f"🖥️ {host_label}"), detail(f"CPU 占用 · {cpu}"),
+             detail(f"内存 · {_fmt_bytes(metrics.get('memory_total_bytes') - metrics.get('memory_free_bytes')) if metrics.get('memory_total_bytes') is not None and metrics.get('memory_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('memory_total_bytes'))}"),
+             detail(f"C盘 · {_fmt_bytes(metrics.get('disk_total_bytes') - metrics.get('disk_free_bytes')) if metrics.get('disk_total_bytes') is not None and metrics.get('disk_free_bytes') is not None else 'N/A'} / {_fmt_bytes(metrics.get('disk_total_bytes'))}"),
+             detail(f"网络 · ↓ {_fmt_rate(metrics.get('network_rx_bps'))} · ↑ {_fmt_rate(metrics.get('network_tx_bps'))}"),
+             detail(f"运行时间 · {_uptime(metrics.get('last_boot'))}")]
     for index, gpu in enumerate(metrics.get("gpus") or []):
         gpu_util = _percent(gpu.get("utilization_gpu"))
         temperature = gpu.get("temperature")
         power_draw = gpu.get("power_draw")
         temperature_text = f"{temperature:.0f}°C" if temperature is not None else "N/A"
         power_text = f"{power_draw:.0f} W" if power_draw is not None else "N/A"
-        lines.extend(["---", f"🎮 GPU {index + 1} · {gpu.get('name', 'NVIDIA GPU')}",
-                      f"GPU 利用率 · {gpu_util}",
-                      f"显存 · {_fmt_bytes(gpu.get('memory_used') * 1024 ** 2) if gpu.get('memory_used') is not None else 'N/A'} / {_fmt_bytes(gpu.get('memory_total') * 1024 ** 2) if gpu.get('memory_total') is not None else 'N/A'}",
-                      f"温度 · {temperature_text}", f"功耗 · {power_text}"])
-    lines.extend(["---", "🔥 Top 进程"])
+        lines.extend(["---", detail(f"🎮 GPU {index + 1} · {gpu.get('name', 'NVIDIA GPU')}"),
+                      detail(f"GPU 利用率 · {gpu_util}"),
+                      detail(f"显存 · {_fmt_bytes(gpu.get('memory_used') * 1024 ** 2) if gpu.get('memory_used') is not None else 'N/A'} / {_fmt_bytes(gpu.get('memory_total') * 1024 ** 2) if gpu.get('memory_total') is not None else 'N/A'}"),
+                      detail(f"温度 · {temperature_text}"), detail(f"功耗 · {power_text}")])
+    lines.extend(["---", detail("🔥 Top 进程")])
     processes = metrics.get("processes") or []
     for proc in processes[:5]:
         name = str(proc.get("name") or "?")[:24]
-        lines.append(f"{name} · CPU {_percent(proc.get('cpu_percent'))} · PID {proc.get('pid', 'N/A')}")
+        lines.append(detail(f"{name} · CPU {_percent(proc.get('cpu_percent'))} · PID {proc.get('pid', 'N/A')}"))
     if error:
-        lines.extend(["---", f"⚠️ {error}"])
+        lines.extend(["---", detail(f"⚠️ {error}")])
     if collected_at:
-        lines.append(f"---\n🕒 {datetime.fromtimestamp(collected_at).astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
+        timestamp = datetime.fromtimestamp(collected_at).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        lines.append(f"---\n{detail(f'🕒 {timestamp}')}")
     lines.extend(["---", _history_action(report_path), "🔄 手动刷新 | refresh=true",
                   f"🔐 打开 SSH | bash=/usr/bin/ssh param1={alias} terminal=true"])
     return "\n".join(lines)
@@ -596,7 +620,7 @@ def main() -> int:
         history_error = None
         try:
             record_history(config.history_path, metrics, collected_at, config.retention_days)
-            write_history_report(config.history_path, config.report_path, collected_at)
+            write_history_report(config.history_path, config.report_path, collected_at, metrics)
         except (OSError, ValueError, sqlite3.Error) as exc:
             history_error = f"历史记录失败：{exc}"
         print(render(metrics, error=history_error, collected_at=collected_at,

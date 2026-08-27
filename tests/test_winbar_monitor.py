@@ -64,7 +64,7 @@ class ParserTests(unittest.TestCase):
     def test_json_with_warning(self):
         self.assertEqual(wm._first_json_object("WARNING\n{" + '"cpu_percent": 1}' )["cpu_percent"], 1)
 
-    def test_render_uses_swiftbar_separator_only_for_actions(self):
+    def test_render_makes_read_only_metrics_open_the_detail_page(self):
         raw = json.loads((ROOT / "na_gpu.json").read_text())
         output = wm.render(wm.normalize_metrics(raw), collected_at=1000)
         lines = output.splitlines()
@@ -74,16 +74,16 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(base64.b64decode(encoded_icon).startswith(b"\x89PNG\r\n\x1a\n"))
         self.assertIn("dropdown=false", lines[0])
         self.assertIn("🟢 在线 · GPU", lines[2])
+        self.assertIn("bash=/usr/bin/open", lines[2])
         self.assertNotIn("refreshOnOpen", output)
-        self.assertIn("CPU 占用 · N/A", lines)
-        self.assertTrue(any(line.startswith("温度 · ") for line in lines))
+        self.assertTrue(any(line.startswith("CPU 占用 · N/A | bash=/usr/bin/open") for line in lines))
+        self.assertTrue(any(line.startswith("温度 · ") and "bash=/usr/bin/open" in line for line in lines))
         parameter_lines = [line for line in lines[1:] if " | " in line]
-        self.assertEqual(len(parameter_lines), 3)
-        self.assertTrue(parameter_lines[0].startswith("📊 查看历史统计"))
-        self.assertIn("bash=/usr/bin/open", parameter_lines[0])
-        self.assertTrue(parameter_lines[1].startswith("🔄 手动刷新"))
-        self.assertTrue(parameter_lines[2].startswith("🔐 打开 SSH"))
-        self.assertIn("🖥️ TEST-WINDOWS", lines)
+        self.assertGreater(len(parameter_lines), 3)
+        self.assertTrue(any(line.startswith("📊 查看历史统计") for line in parameter_lines))
+        self.assertTrue(any(line.startswith("🔄 手动刷新") for line in parameter_lines))
+        self.assertTrue(any(line.startswith("🔐 打开 SSH") for line in parameter_lines))
+        self.assertTrue(any(line.startswith("🖥️ TEST-WINDOWS | bash=/usr/bin/open") for line in lines))
 
     def test_render_hostname_fallback_order(self):
         with patch.dict(os.environ, {"WINBAR_SSH_ALIAS": "my-windows"}, clear=False):
@@ -174,8 +174,9 @@ class HistoryTests(unittest.TestCase):
                 count = database.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
             self.assertEqual(count, 1)
             report = report_path.read_text(encoding="utf-8")
-            self.assertIn("WinBarMonitor 历史统计", report)
+            self.assertIn("WinBarMonitor 实时概览", report)
             self.assertIn('"count":1', report)
+            self.assertIn('id="current-cards"', report)
             self.assertIn("<canvas id=\"util\"", report)
             self.assertIn("className='tooltip'", report)
             self.assertIn("canvas.onmousemove", report)
