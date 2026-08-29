@@ -1,40 +1,202 @@
 # WinBarMonitor
 
-WinBarMonitor 是一个零依赖的 SwiftBar 插件：在 macOS 顶部菜单栏显示远程 Windows 11 的 CPU、内存、C 盘、网络、运行时间和 NVIDIA GPU 指标。远程端只执行只读 PowerShell/CIM 查询及 `nvidia-smi`，不会修改 Windows。
+[![CI](https://github.com/RS-zlk/WinBarMonitor/actions/workflows/ci.yml/badge.svg)](https://github.com/RS-zlk/WinBarMonitor/actions/workflows/ci.yml)
 
-## 安装
+WinBarMonitor is a dependency-free [SwiftBar](https://swiftbar.app/) plugin
+that puts live metrics from a remote Windows PC in the macOS menu bar. It
+shows CPU, memory, C: drive, network, uptime, top processes, and optional
+NVIDIA GPU data. The remote command performs read-only PowerShell/CIM queries
+and an optional `nvidia-smi` query.
 
-1. 安装并运行 [SwiftBar](https://swiftbar.app/)，选择插件目录。
-2. 在本目录执行 `./install.sh`。若 SwiftBar 使用了自定义目录：`SWIFTBAR_PLUGIN_DIR="/path/to/plugins" ./install.sh`。
-3. 确认 Mac 已可无交互执行 `ssh y9000p-remote`（推荐 SSH key，不要把密码或私钥写入仓库）。
-4. SwiftBar 选择刷新插件。插件默认每 30 秒刷新，点击顶部图标即可展开实时指标。
+[中文文档](README.zh-CN.md)
 
-环境变量：`WINBAR_SSH_ALIAS`（默认 `y9000p-remote`）、`WINBAR_REFRESH_SECONDS`（默认 30）、`WINBAR_SSH_TIMEOUT`（默认 15）、`WINBAR_CACHE_PATH`（默认 `~/.cache/winbar-monitor/cache.json`）。安装时 `WINBAR_REFRESH_SECONDS=10 ./install.sh` 会生成 `winbar.10s.py`，SwiftBar 按文件名每 10 秒在后台刷新；点击插件图标会立即显示最近一次结果，需要即时重新采集时可选择菜单中的“手动刷新”。远程 CIM 查询在慢链路上可能需要数秒，插件会使用 SSH 连接复用来降低后续刷新延迟。
+## Features
 
-## 历史统计
+- Generic SSH alias by default: `windows-monitor`.
+- Displays the remote hostname, then the configured alias, then `Windows PC`
+  when the hostname is unavailable.
+- Green online, yellow cached, and red offline custom PNG icons.
+- Last successful metrics are cached locally for short offline visibility.
+- Successful samples are retained in a local SQLite database for 30 days by
+  default, with a self-contained browser dashboard.
+- Configurable low-GPU/VRAM task-complete notifications use native macOS
+  notifications after a sustained low-usage period.
+- Machine-specific settings live in a Git-ignored `.winbar.env` file.
+- No third-party Python packages and no service hosted by this project.
+- Handles no NVIDIA GPU, multiple GPUs, `N/A` values, and slow SSH links.
 
-每次成功采集都会写入本机 SQLite 数据库，并更新一个不依赖网络的 HTML 报告。SwiftBar 菜单中的“📊 查看历史统计”会用默认浏览器打开报告；菜单本身不展示统计摘要。报告提供最近 24 小时、7 天和 30 天的 CPU/GPU、内存/显存、温度/功耗及网络速率图表。
+## Requirements
 
-- 数据库：`~/.local/share/winbar-monitor/history.sqlite3`
-- HTML 报告：`~/.local/share/winbar-monitor/history.html`
-- 原始数据默认保留 30 天，过期数据在成功采集时自动清理
-- SSH 失败期间不写入虚假的零值，也不会覆盖已有历史报告
+- macOS with Python 3 and [SwiftBar](https://swiftbar.app/).
+- The macOS `ssh` client and an SSH alias that reaches the Windows host.
+- Windows OpenSSH Server, PowerShell, and CIM/WMI access for the account.
+- NVIDIA drivers and `nvidia-smi` only if GPU metrics are wanted.
 
-可用 `WINBAR_HISTORY_PATH`、`WINBAR_REPORT_PATH` 和 `WINBAR_RETENTION_DAYS` 修改上述路径及保留天数。卸载插件时历史数据库与报告会保留，便于备份或手动删除。
+The project has zero third-party Python dependencies. It uses only Python's
+standard library, POSIX shell utilities, macOS `ssh`, and Windows built-ins.
 
-## 安全与网络
+## Installation
 
-插件使用 `BatchMode=yes` 和 5 秒连接建立超时，整次采集默认最多等待 15 秒。最近一次成功结果保存在本机缓存，离线时显示“缓存”状态和简短错误信息，不会卡住菜单栏。建议通过 Tailscale/SSH 隧道连接，不要把 PowerShell/监控端口暴露到公网；SSH 服务本身请使用密钥、最小权限账号和防火墙白名单。阿里云服务器可作为 Tailscale/反向 SSH 的中继，但本插件不需要把指标上传到服务器。
+1. Install and launch SwiftBar, then choose its plugin folder.
+2. Create a machine-local configuration file:
 
-## 开发与测试
+   ```sh
+   cp .winbar.env.example .winbar.env
+   ```
+
+   Edit `.winbar.env` and set `WINBAR_SSH_ALIAS` to the SSH config alias for
+   the Windows PC. This local file is ignored by Git.
+3. Verify a non-interactive connection:
+
+   ```sh
+   ssh windows-monitor  # Replace with the alias configured in .winbar.env.
+   ```
+
+4. Install the plugin:
+
+   ```sh
+   ./install.sh
+   ```
+
+Refresh SwiftBar. The generated plugin filename controls SwiftBar's refresh
+interval. The installer copies the local configuration into SwiftBar with
+owner-only permissions. Opening the menu is immediate and does not trigger a
+new SSH request; use the manual refresh action when needed.
+
+## Windows OpenSSH and keys
+
+On Windows, install and start the OpenSSH Server optional feature, permit SSH
+through the Windows Firewall, and use a dedicated least-privilege account.
+From macOS, create a key with `ssh-keygen`, append its public key to the
+Windows account's authorized keys file, and add a host entry to
+`~/.ssh/config`:
+
+```sshconfig
+Host windows-monitor
+    HostName windows.example.invalid
+    User monitor
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+```
+
+Use a private network or VPN, restrict firewall sources, and keep SSH
+`BatchMode` authentication enabled. Never commit private keys, passwords,
+tokens, or real host addresses.
+
+## Local configuration
+
+`.winbar.env` uses shell-style `KEY=VALUE` lines. Keep real host aliases and
+machine-specific paths in that file, never in tracked source files. The
+installer reads the file to determine the plugin location and refresh
+interval, then copies it beside the installed support module. Runtime
+environment variables override values from the file.
+
+All settings are optional:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WINBAR_SSH_ALIAS` | `windows-monitor` | SSH config alias |
+| `WINBAR_REFRESH_SECONDS` | `30` | Positive plugin refresh interval |
+| `WINBAR_SSH_TIMEOUT` | `15` | Positive total collection timeout |
+| `WINBAR_CACHE_PATH` | `~/.cache/winbar-monitor/cache.json` | Local cache file |
+| `WINBAR_HISTORY_PATH` | `~/.local/share/winbar-monitor/history.sqlite3` | Local history database |
+| `WINBAR_REPORT_PATH` | `~/.local/share/winbar-monitor/history.html` | Generated dashboard |
+| `WINBAR_RETENTION_DAYS` | `30` | Raw sample retention period |
+| `WINBAR_LOW_USAGE_ALERT_ENABLED` | `false` | Enables the possible-task-complete alert |
+| `WINBAR_LOW_USAGE_GPU_THRESHOLD` | `5` | Low GPU-utilization threshold (0–100 percent) |
+| `WINBAR_LOW_USAGE_VRAM_THRESHOLD` | `10` | Low per-GPU VRAM-use threshold (0–100 percent) |
+| `WINBAR_LOW_USAGE_DURATION_SECONDS` | `300` | Required continuous low-usage duration in seconds |
+| `WINBAR_ALERT_STATE_PATH` | `~/.local/share/winbar-monitor/low-usage-alert-state.json` | Local alert detector state |
+| `SWIFTBAR_PLUGIN_DIR` | SwiftBar's standard plugin folder | Installation location |
+
+Set `WINBAR_CONFIG_FILE=/path/to/settings.env` when running `install.sh` or
+`uninstall.sh` to use a differently named local file. Values for numeric
+settings are clamped to a minimum of one.
+
+## Task-complete notifications
+
+Open `⏰ 任务完成提醒` in the SwiftBar menu. One-click presets include
+`10% / 10% / 20 minutes` and `5% / 5% / 10 minutes`. The custom-rule action
+opens one input dialog for all values: `GPU threshold, VRAM threshold, minutes`
+(for example, `5, 5, 10`). The same menu can disable the alert immediately.
+
+The alert fires once when every reported GPU is at or below both thresholds for
+the full duration.
+Once GPU activity rises again, it re-arms for the next workload. Cached,
+missing, or `N/A` readings never start or extend the timer. Alerts are disabled
+by default; their defaults are 5% GPU, 10% VRAM, and five minutes. You may set
+the values from the menu or use the `WINBAR_LOW_USAGE_*` variables above.
+
+## Historical dashboard
+
+Each successful collection appends one sample to SQLite and regenerates a
+self-contained HTML report. The SwiftBar menu only contains a
+`View history` action; all summaries and charts are shown in the browser.
+
+The report provides 24-hour, 7-day, and 30-day views for CPU/GPU utilization,
+memory/VRAM, GPU temperature/power, and network rates. Multi-GPU history uses
+the highest utilization and temperature plus combined VRAM and power. Failed
+collections are omitted instead of being stored as zero values. No external
+JavaScript, analytics, fonts, or network requests are used by the report.
+Hover over a chart point to see its local timestamp and series values.
+
+## Security and privacy
+
+The plugin sends one encoded, read-only PowerShell command over SSH. It does
+not upload metrics, accept inbound connections, or store credentials. SSH
+keys, cache, history, and report remain under the user's control. The cache can
+contain a hostname and process names; history reveals machine-usage patterns.
+Do not attach generated files to public issues. Review the command and the
+[security policy](SECURITY.md) before deploying on a managed machine.
+
+## Uninstall
+
+Run the same configuration used for installation:
 
 ```sh
-python3 -m unittest discover -s tests -v
 ./uninstall.sh
 ```
 
-测试覆盖 NVIDIA CSV 的 `N/A`、无 GPU JSON、异常值归一化、PowerShell 警告前缀 JSON、缓存读取、历史数据保留和自包含 HTML 报告。真实连接测试由用户环境决定：`ssh y9000p-remote` 应先在 Mac 终端通过。
+This removes generated SwiftBar files and its copied configuration. It leaves
+the source `.winbar.env`, cache, history, and report untouched. Delete local
+monitoring data manually if desired:
 
-## 已知限制
+```sh
+rm -f "$HOME/.cache/winbar-monitor/cache.json"
+rm -f "$HOME/.local/share/winbar-monitor/history.sqlite3" \
+      "$HOME/.local/share/winbar-monitor/history.sqlite3-shm" \
+      "$HOME/.local/share/winbar-monitor/history.sqlite3-wal" \
+      "$HOME/.local/share/winbar-monitor/history.html"
+```
 
-GPU 指标依赖 Windows 端 NVIDIA 驱动提供的 `nvidia-smi`；网络是采集时刻的累计性能计数器速率；top 进程来自 Windows PerfFormattedData，排序粒度受 Windows 采样刷新影响。SwiftBar 菜单栏本身不适合绘制历史曲线。
+## Troubleshooting
+
+- `ssh windows-monitor` first; fix SSH authentication or name resolution
+  before debugging the plugin.
+- If the menu shows yellow, the last collection failed and the local cache is
+  being displayed. Red means no usable cache exists.
+- If GPU fields are `N/A`, check that `nvidia-smi` works in the Windows SSH
+  session. Systems without NVIDIA hardware remain supported and show no GPU
+  section.
+- For slow links, increase `WINBAR_SSH_TIMEOUT` and use SSH connection
+  multiplexing. Do not expose the Windows SSH service to the public internet.
+
+## Development and tests
+
+Run the standard-library test suite and shell syntax checks:
+
+```sh
+python3 -m unittest discover -s tests -v
+python3 -m py_compile winbar_monitor.py winbar.1m.py
+sh -n install.sh uninstall.sh
+```
+
+Tests use synthetic fixtures only; CI never makes a real SSH connection.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow.
+
+No live-host screenshot or generated report is committed. Tests use synthetic
+fixtures so repository artifacts do not expose machine data.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
