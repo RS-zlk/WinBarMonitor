@@ -19,6 +19,8 @@ and an optional `nvidia-smi` query.
 - Last successful metrics are cached locally for short offline visibility.
 - Successful samples are retained in a local SQLite database for 30 days by
   default, with a self-contained browser dashboard.
+- Configurable low-GPU/VRAM task-complete notifications use native macOS
+  notifications after a sustained low-usage period.
 - Machine-specific settings live in a Git-ignored `.winbar.env` file.
 - No third-party Python packages and no service hosted by this project.
 - Handles no NVIDIA GPU, multiple GPUs, `N/A` values, and slow SSH links.
@@ -100,11 +102,30 @@ All settings are optional:
 | `WINBAR_HISTORY_PATH` | `~/.local/share/winbar-monitor/history.sqlite3` | Local history database |
 | `WINBAR_REPORT_PATH` | `~/.local/share/winbar-monitor/history.html` | Generated dashboard |
 | `WINBAR_RETENTION_DAYS` | `30` | Raw sample retention period |
+| `WINBAR_LOW_USAGE_ALERT_ENABLED` | `false` | Enables the possible-task-complete alert |
+| `WINBAR_LOW_USAGE_GPU_THRESHOLD` | `5` | Low GPU-utilization threshold (0–100 percent) |
+| `WINBAR_LOW_USAGE_VRAM_THRESHOLD` | `10` | Low per-GPU VRAM-use threshold (0–100 percent) |
+| `WINBAR_LOW_USAGE_DURATION_SECONDS` | `300` | Required continuous low-usage duration in seconds |
+| `WINBAR_ALERT_STATE_PATH` | `~/.local/share/winbar-monitor/low-usage-alert-state.json` | Local alert detector state |
 | `SWIFTBAR_PLUGIN_DIR` | SwiftBar's standard plugin folder | Installation location |
 
 Set `WINBAR_CONFIG_FILE=/path/to/settings.env` when running `install.sh` or
 `uninstall.sh` to use a differently named local file. Values for numeric
 settings are clamped to a minimum of one.
+
+## Task-complete notifications
+
+Open `⏰ 任务完成提醒` in the SwiftBar menu. One-click presets include
+`10% / 10% / 20 minutes` and `5% / 5% / 10 minutes`. The custom-rule action
+opens one input dialog for all values: `GPU threshold, VRAM threshold, minutes`
+(for example, `5, 5, 10`). The same menu can disable the alert immediately.
+
+The alert fires once when every reported GPU is at or below both thresholds for
+the full duration.
+Once GPU activity rises again, it re-arms for the next workload. Cached,
+missing, or `N/A` readings never start or extend the timer. Alerts are disabled
+by default; their defaults are 5% GPU, 10% VRAM, and five minutes. You may set
+the values from the menu or use the `WINBAR_LOW_USAGE_*` variables above.
 
 ## Historical dashboard
 

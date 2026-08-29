@@ -16,6 +16,7 @@ Top 进程以及可选的 NVIDIA GPU 指标。远端只执行只读 PowerShell/C
 - 在线、缓存、离线分别使用绿色、黄色、红色彩色 PNG 图标。
 - 本地缓存最近一次成功指标，短暂断网时仍可查看。
 - 成功采集的数据默认在本地 SQLite 中保留 30 天，并生成浏览器统计页面。
+- 可在菜单中设置 GPU/显存低占用阈值和持续时间；达到条件时发送 macOS 原生通知。
 - 机器专属设置保存在 Git 忽略的 `.winbar.env` 中。
 - 不需要第三方 Python 包，也不需要本项目提供的服务器。
 - 支持无 NVIDIA GPU、多 GPU、`N/A` 值和较慢 SSH 链路。
@@ -91,6 +92,11 @@ Host windows-monitor
 | `WINBAR_HISTORY_PATH` | `~/.local/share/winbar-monitor/history.sqlite3` | 本地历史数据库 |
 | `WINBAR_REPORT_PATH` | `~/.local/share/winbar-monitor/history.html` | 生成的统计页面 |
 | `WINBAR_RETENTION_DAYS` | `30` | 原始采样保留天数 |
+| `WINBAR_LOW_USAGE_ALERT_ENABLED` | `false` | 是否启用“任务可能完成”提醒 |
+| `WINBAR_LOW_USAGE_GPU_THRESHOLD` | `5` | GPU 利用率低占用阈值（0–100，百分比） |
+| `WINBAR_LOW_USAGE_VRAM_THRESHOLD` | `10` | 单块 GPU 显存占用低占用阈值（0–100，百分比） |
+| `WINBAR_LOW_USAGE_DURATION_SECONDS` | `300` | 低占用持续时间（秒） |
+| `WINBAR_ALERT_STATE_PATH` | `~/.local/share/winbar-monitor/low-usage-alert-state.json` | 提醒状态文件 |
 | `SWIFTBAR_PLUGIN_DIR` | SwiftBar 标准插件目录 | 安装位置 |
 
 运行安装或卸载脚本时，可通过 `WINBAR_CONFIG_FILE=/path/to/settings.env` 使用其他
@@ -111,6 +117,23 @@ SwiftBar 菜单只提供“查看历史统计”入口，汇总和图表均在�
 在 SwiftBar 菜单中打开“⚙️ 菜单栏显示设置”，可用中文选项切换智能概览、GPU/CPU
 利用率、显存占用、GPU 温度、GPU 功耗或网络下载速率。设置仅保存在本机；菜单栏中的
 彩色显示器图标表示状态，绿色、黄色和红色依次表示在线、使用缓存和离线状态。
+
+## 任务完成提醒
+
+在 SwiftBar 菜单中展开“⏰ 任务完成提醒”。可一键启用 `10% / 10% / 20 分钟`、
+`5% / 5% / 10 分钟`等预设；也可选择“输入自定义规则并启用…”，打开**一个**输入框，
+一次填写 `GPU 阈值, 显存阈值, 持续分钟`，例如 `5, 5, 10`。选择“关闭提醒”可立即撤销。
+这些偏好仅保存在本机的 `settings.json` 中，不会修改项目文件。
+
+当**所有**远端 GPU 的利用率和显存占用均不高于相应阈值，且这个状态连续维持设定时长时，
+macOS 会发送一次“任务可能已完成”的原生通知。
+GPU 再次高于任一阈值后，提醒会自动重新布防，可用于下一次任务。缓存数据、采集失败、
+无 GPU 或 `N/A` 指标不会开始或延长计时，以避免误报。
+
+默认关闭提醒，避免升级后意外打扰。默认阈值为 GPU `5%`、显存 `10%`、持续 `5` 分钟；
+可以在菜单中自由修改，也可以用上表的 `WINBAR_LOW_USAGE_*` 环境变量或 `.winbar.env` 预设。
+显存可能被机器学习框架缓存，因此若任务结束后显存不会释放，可把显存阈值提高，或先关闭
+提醒再重新配置合适的条件。
 
 ## 安全与隐私
 

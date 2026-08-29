@@ -183,6 +183,177 @@ class CacheAndTimeoutTests(unittest.TestCase):
         self.assertIn("🔴 离线", printer.call_args.args[0])
 
 
+class LowUsageAlertTests(unittest.TestCase):
+    @staticmethod
+    def _metrics(*, gpu_utilization=3, memory_used=400, memory_total=10_000):
+        return wm.normalize_metrics({
+            "hostname": "TRAINING-PC",
+            "gpus": [{
+                "name": "GPU A",
+                "utilization_gpu": gpu_utilization,
+                "memory_used": memory_used,
+                "memory_total": memory_total,
+            }],
+        })
+
+    def test_low_usage_alert_notifies_once_and_rearms_after_activity(self):
+        alert = wm.LowUsageAlertConfig(
+            enabled=True, gpu_utilization_threshold=5, vram_utilization_threshold=10,
+            duration_seconds=120,
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            state_path = Path(folder) / "alert-state.json"
+            first, notify = wm.update_low_usage_alert(state_path, alert, self._metrics(), 1_000)
+            self.assertFalse(notify)
+            self.assertEqual(first.low_since, 1_000)
+
+            due, notify = wm.update_low_usage_alert(state_path, alert, self._metrics(), 1_120)
+            self.assertTrue(notify)
+            self.assertFalse(due.notified)
+            wm.mark_low_usage_alert_notified(state_path, alert)
+            notified, notify = wm.update_low_usage_alert(state_path, alert, self._metrics(), 1_180)
+            self.assertFalse(notify)
+            self.assertTrue(notified.notified)
+
+            active, notify = wm.update_low_usage_alert(
+                state_path, alert, self._metrics(gpu_utilization=36), 1_200)
+            self.assertFalse(notify)
+            self.assertIsNone(active.low_since)
+            restarted, notify = wm.update_low_usage_alert(state_path, alert, self._metrics(), 1_300)
+            self.assertFalse(notify)
+            self.assertEqual(restarted.low_since, 1_300)
+            _, notify = wm.update_low_usage_alert(state_path, alert, self._metrics(), 1_420)
+            self.assertTrue(notify)
+
+    def test_missing_gpu_reading_cannot_extend_low_usage_timer(self):
+        alert = wm.LowUsageAlertConfig(enabled=True, duration_seconds=120)
+        with tempfile.TemporaryDirectory() as folder:
+            state_path = Path(folder) / "alert-state.json"
+            wm.update_low_usage_alert(state_path, alert, self._metrics(), 1_000)
+            unknown, notify = wm.update_low_usage_alert(
+                state_path, alert, wm.normalize_metrics({"gpus": [{"utilization_gpu": "N/A"}]}), 1_050)
+            self.assertFalse(notify)
+            self.assertIsNone(unknown.low_since)
+            _, notify = wm.update_low_usage_alert(state_path, alert, self._metrics(), 1_120)
+            self.assertFalse(notify)
+
+    def test_one_gpu_with_high_vram_prevents_an_alert_on_multi_gpu_hosts(self):
+        alert = wm.LowUsageAlertConfig(enabled=True, gpu_utilization_threshold=5,
+                                       vram_utilization_threshold=10, duration_seconds=60)
+        metrics = wm.normalize_metrics({"gpus": [
+            {"utilization_gpu": 2, "memory_used": 1_600, "memory_total": 10_000},
+            {"utilization_gpu": 2, "memory_used": 0, "memory_total": 10_000},
+        ]})
+        with tempfile.TemporaryDirectory() as folder:
+            status, notify = wm.update_low_usage_alert(Path(folder) / "alert-state.json", alert, metrics, 1_000)
+        self.assertFalse(notify)
+        self.assertIsNone(status.low_since)
+        self.assertEqual(status.vram_utilization, 16)
+
+    def test_disabling_an_alert_clears_an_existing_low_usage_timer(self):
+        enabled = wm.LowUsageAlertConfig(enabled=True, duration_seconds=120)
+        disabled = wm.LowUsageAlertConfig(enabled=False, duration_seconds=120)
+        with tempfile.TemporaryDirectory() as folder:
+            state_path = Path(folder) / "alert-state.json"
+            wm.update_low_usage_alert(state_path, enabled, self._metrics(), 1_000)
+            wm.update_low_usage_alert(state_path, disabled, self._metrics(), 1_050)
+            restarted, notify = wm.update_low_usage_alert(state_path, enabled, self._metrics(), 1_120)
+        self.assertFalse(notify)
+        self.assertEqual(restarted.low_since, 1_120)
+
+    def test_alert_settings_preserve_menu_bar_setting_and_can_be_toggled(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings_path = Path(folder) / "settings.json"
+            alert = wm.LowUsageAlertConfig(enabled=True, gpu_utilization_threshold=7,
+                                           vram_utilization_threshold=12, duration_seconds=90)
+            wm.save_low_usage_alert_config(settings_path, alert)
+            wm.save_menu_bar_mode(settings_path, "power")
+            self.assertEqual(wm._read_settings(settings_path)["menu_bar_mode"], "power")
+            self.assertEqual(wm._low_usage_alert_config(wm._read_settings(settings_path)["low_usage_alert"]), alert)
+            self.assertEqual(wm.cli_main(["--set-low-usage-alert-enabled", "false", "--settings-path", str(settings_path)]), 0)
+            self.assertFalse(wm._low_usage_alert_config(wm._read_settings(settings_path)["low_usage_alert"]).enabled)
+
+    def test_saved_alert_settings_override_local_config_but_not_environment(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder_path = Path(folder)
+            config_path = folder_path / ".winbar.env"
+            settings_path = folder_path / "settings.json"
+            config_path.write_text(
+                f"WINBAR_SETTINGS_PATH={settings_path}\n"
+                "WINBAR_LOW_USAGE_ALERT_ENABLED=true\n"
+                "WINBAR_LOW_USAGE_GPU_THRESHOLD=4\n",
+                encoding="utf-8",
+            )
+            wm.save_low_usage_alert_config(settings_path, wm.LowUsageAlertConfig(
+                enabled=False, gpu_utilization_threshold=8, vram_utilization_threshold=15,
+                duration_seconds=180,
+            ))
+            with patch.dict(os.environ, {"WINBAR_CONFIG_PATH": str(config_path)}, clear=True):
+                config = wm.Config.from_env()
+            self.assertFalse(config.low_usage_alert.enabled)
+            self.assertEqual(config.low_usage_alert.gpu_utilization_threshold, 8)
+            with patch.dict(os.environ, {
+                "WINBAR_CONFIG_PATH": str(config_path), "WINBAR_LOW_USAGE_GPU_THRESHOLD": "3",
+            }, clear=True):
+                config = wm.Config.from_env()
+            self.assertEqual(config.low_usage_alert.gpu_utilization_threshold, 3)
+
+    def test_cli_saves_arbitrary_custom_thresholds_without_a_dialog(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings_path = Path(folder) / "settings.json"
+            result = wm.cli_main([
+                "--set-low-usage-alert", "true", "6.5", "18", "90",
+                "--settings-path", str(settings_path),
+            ])
+            saved = wm._low_usage_alert_config(wm._read_settings(settings_path)["low_usage_alert"])
+        self.assertEqual(result, 0)
+        self.assertEqual(saved, wm.LowUsageAlertConfig(enabled=True, gpu_utilization_threshold=6.5,
+                                                        vram_utilization_threshold=18, duration_seconds=90))
+
+    def test_one_dialog_parses_all_custom_rule_values(self):
+        with patch("winbar_monitor._prompt_with_osascript", return_value="6.5, 18, 1.5") as prompt:
+            alert = wm._prompt_low_usage_alert_config(wm.LowUsageAlertConfig())
+        self.assertEqual(alert, wm.LowUsageAlertConfig(enabled=True, gpu_utilization_threshold=6.5,
+                                                        vram_utilization_threshold=18, duration_seconds=90))
+        self.assertIn("GPU 阈值 %, 显存阈值 %, 持续时间", prompt.call_args.args[0])
+
+    def test_render_exposes_configure_action_and_detector_status(self):
+        alert = wm.LowUsageAlertConfig(enabled=True, duration_seconds=300)
+        status = wm.LowUsageAlertStatus(monitoring=True, low_since=900,
+                                        max_gpu_utilization=3, vram_utilization=4)
+        rendered = wm.render(self._metrics(), collected_at=1_000, low_usage_alert=alert,
+                             low_usage_alert_status=status)
+        self.assertIn("⏰ 任务完成提醒", rendered)
+        self.assertIn("状态 · 低占用计时中 · 1 分钟 40 秒 / 5 分钟", rendered)
+        self.assertIn("--快速预设", rendered)
+        self.assertIn("--输入自定义规则并启用…", rendered)
+        self.assertIn("param3=--configure-low-usage-alert", rendered)
+        self.assertIn("param3=--set-low-usage-alert", rendered)
+        self.assertIn("--关闭提醒", rendered)
+
+    def test_alert_submenu_keeps_a_constant_parent_and_child_count(self):
+        def section(alert):
+            lines = wm.render(self._metrics(), low_usage_alert=alert).splitlines()
+            start = lines.index("⏰ 任务完成提醒")
+            return lines[start:lines.index("---", start)]
+
+        disabled = section(wm.LowUsageAlertConfig(enabled=False))
+        enabled = section(wm.LowUsageAlertConfig(enabled=True))
+        direct_children = lambda lines: [line for line in lines if line.startswith("--") and not line.startswith("---") and not line.startswith("----")]
+        self.assertEqual(disabled[0], enabled[0])
+        self.assertEqual(len(direct_children(disabled)), len(direct_children(enabled)))
+
+    def test_notification_uses_native_macos_notification(self):
+        alert = wm.LowUsageAlertConfig(enabled=True, duration_seconds=300)
+        status = wm.LowUsageAlertStatus(max_gpu_utilization=2, vram_utilization=4)
+        with patch("winbar_monitor.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            wm.send_low_usage_notification("TRAINING-PC", alert, status)
+        command = run.call_args.args[0]
+        self.assertEqual(command[:2], ["/usr/bin/osascript", "-e"])
+        self.assertIn("display notification", command[2])
+        self.assertIn("任务可能已完成", command[2])
+
+
 class HistoryTests(unittest.TestCase):
     def test_records_prunes_and_generates_self_contained_report(self):
         metrics = wm.normalize_metrics(json.loads((ROOT / "no_gpu.json").read_text()))

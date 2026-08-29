@@ -12,6 +12,8 @@ All notable changes to this project are documented here.
 - SwiftBar action for opening the dashboard without showing statistics in the
   menu itself.
 - Hover tooltips that show the timestamp and values for chart data points.
+- Configurable sustained-low GPU/VRAM alert with native macOS notification,
+  persisted detector state, and automatic re-arming after GPU activity.
 
 ### Changed
 

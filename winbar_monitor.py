@@ -20,7 +20,7 @@ import sys
 import time
 import zlib
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -32,6 +32,7 @@ DEFAULT_CACHE_PATH = Path.home() / ".cache" / "winbar-monitor" / "cache.json"
 DEFAULT_HISTORY_PATH = Path.home() / ".local" / "share" / "winbar-monitor" / "history.sqlite3"
 DEFAULT_REPORT_PATH = Path.home() / ".local" / "share" / "winbar-monitor" / "history.html"
 DEFAULT_SETTINGS_PATH = Path.home() / ".local" / "share" / "winbar-monitor" / "settings.json"
+DEFAULT_ALERT_STATE_PATH = Path.home() / ".local" / "share" / "winbar-monitor" / "low-usage-alert-state.json"
 DEFAULT_RETENTION_DAYS = 30
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().with_name(".winbar.env")
 MENU_BAR_MODES = ("auto", "gpu", "cpu", "vram", "temperature", "power", "network")
@@ -40,6 +41,9 @@ MENU_BAR_MODE_LABELS = {
     "vram": "显存占用", "temperature": "GPU 温度", "power": "GPU 功耗",
     "network": "网络下载速率",
 }
+DEFAULT_LOW_USAGE_GPU_THRESHOLD = 5.0
+DEFAULT_LOW_USAGE_VRAM_THRESHOLD = 10.0
+DEFAULT_LOW_USAGE_DURATION_SECONDS = 5 * 60
 
 
 POWERSHELL_SCRIPT = r'''
@@ -87,6 +91,35 @@ $netTx = ($netRows | Measure-Object -Property BytesSentPersec -Sum).Sum
 
 
 @dataclass(frozen=True)
+class LowUsageAlertConfig:
+    """User-configurable definition of a likely-finished GPU workload."""
+
+    enabled: bool = False
+    gpu_utilization_threshold: float = DEFAULT_LOW_USAGE_GPU_THRESHOLD
+    vram_utilization_threshold: float = DEFAULT_LOW_USAGE_VRAM_THRESHOLD
+    duration_seconds: int = DEFAULT_LOW_USAGE_DURATION_SECONDS
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "gpu_utilization_threshold": self.gpu_utilization_threshold,
+            "vram_utilization_threshold": self.vram_utilization_threshold,
+            "duration_seconds": self.duration_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class LowUsageAlertStatus:
+    """The current detector state used for menu feedback and notifications."""
+
+    monitoring: bool = False
+    low_since: float | None = None
+    notified: bool = False
+    max_gpu_utilization: float | None = None
+    vram_utilization: float | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     ssh_alias: str = "windows-monitor"
     refresh_seconds: int = DEFAULT_REFRESH_SECONDS
@@ -96,7 +129,9 @@ class Config:
     report_path: Path = DEFAULT_REPORT_PATH
     retention_days: int = DEFAULT_RETENTION_DAYS
     settings_path: Path = DEFAULT_SETTINGS_PATH
+    alert_state_path: Path = DEFAULT_ALERT_STATE_PATH
     menu_bar_mode: str = "auto"
+    low_usage_alert: LowUsageAlertConfig = LowUsageAlertConfig()
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -117,10 +152,25 @@ class Config:
         history_path = value("WINBAR_HISTORY_PATH", None)
         report_path = value("WINBAR_REPORT_PATH", None)
         settings_path = value("WINBAR_SETTINGS_PATH", None)
+        alert_state_path = value("WINBAR_ALERT_STATE_PATH", None)
         resolved_settings_path = Path(settings_path).expanduser() if settings_path else DEFAULT_SETTINGS_PATH
         saved_settings = _read_settings(resolved_settings_path)
         menu_bar_mode = str(os.environ.get("WINBAR_MENU_BAR_MODE", saved_settings.get(
             "menu_bar_mode", local.get("WINBAR_MENU_BAR_MODE", cls.menu_bar_mode))))
+        saved_alert = saved_settings.get("low_usage_alert")
+        saved_alert = saved_alert if isinstance(saved_alert, dict) else {}
+
+        def alert_value(environment_name: str, setting_name: str) -> Any:
+            """Runtime variables win; menu settings win over static local config."""
+            return os.environ.get(environment_name, saved_alert.get(setting_name, local.get(environment_name)))
+
+        low_usage_alert = _low_usage_alert_config(
+            None,
+            enabled=alert_value("WINBAR_LOW_USAGE_ALERT_ENABLED", "enabled"),
+            gpu_threshold=alert_value("WINBAR_LOW_USAGE_GPU_THRESHOLD", "gpu_utilization_threshold"),
+            vram_threshold=alert_value("WINBAR_LOW_USAGE_VRAM_THRESHOLD", "vram_utilization_threshold"),
+            duration_seconds=alert_value("WINBAR_LOW_USAGE_DURATION_SECONDS", "duration_seconds"),
+        )
         return cls(
             ssh_alias=str(value("WINBAR_SSH_ALIAS", cls.ssh_alias)),
             refresh_seconds=positive_int("WINBAR_REFRESH_SECONDS", DEFAULT_REFRESH_SECONDS),
@@ -130,7 +180,9 @@ class Config:
             report_path=Path(report_path).expanduser() if report_path else DEFAULT_REPORT_PATH,
             retention_days=positive_int("WINBAR_RETENTION_DAYS", DEFAULT_RETENTION_DAYS),
             settings_path=resolved_settings_path,
+            alert_state_path=Path(alert_state_path).expanduser() if alert_state_path else DEFAULT_ALERT_STATE_PATH,
             menu_bar_mode=menu_bar_mode if menu_bar_mode in MENU_BAR_MODES else cls.menu_bar_mode,
+            low_usage_alert=low_usage_alert,
         )
 
 
@@ -169,15 +221,72 @@ def _read_settings(path: Path) -> dict[str, Any]:
     return settings if isinstance(settings, dict) else {}
 
 
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("1", "true", "yes", "on"):
+            return True
+        if normalized in ("0", "false", "no", "off"):
+            return False
+    return default
+
+
+def _bounded_percent(value: Any, default: float) -> float:
+    number = _number(value)
+    return number if number is not None and 0 <= number <= 100 else default
+
+
+def _positive_seconds(value: Any, default: int) -> int:
+    number = _number(value)
+    return int(number) if number is not None and number >= 1 else default
+
+
+def _low_usage_alert_config(saved: Any = None, *, enabled: Any = None,
+                            gpu_threshold: Any = None, vram_threshold: Any = None,
+                            duration_seconds: Any = None) -> LowUsageAlertConfig:
+    saved = saved if isinstance(saved, dict) else {}
+    return LowUsageAlertConfig(
+        enabled=_as_bool(enabled, _as_bool(saved.get("enabled"), False)) if enabled is not None
+        else _as_bool(saved.get("enabled"), False),
+        gpu_utilization_threshold=_bounded_percent(
+            gpu_threshold if gpu_threshold is not None else saved.get("gpu_utilization_threshold"),
+            DEFAULT_LOW_USAGE_GPU_THRESHOLD,
+        ),
+        vram_utilization_threshold=_bounded_percent(
+            vram_threshold if vram_threshold is not None else saved.get("vram_utilization_threshold"),
+            DEFAULT_LOW_USAGE_VRAM_THRESHOLD,
+        ),
+        duration_seconds=_positive_seconds(
+            duration_seconds if duration_seconds is not None else saved.get("duration_seconds"),
+            DEFAULT_LOW_USAGE_DURATION_SECONDS,
+        ),
+    )
+
+
+def _write_settings(path: Path, updates: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    settings = _read_settings(path)
+    settings.update(updates)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    path.chmod(0o600)
+
+
 def save_menu_bar_mode(path: Path, mode: str) -> None:
     """Save a user-selected display mode without modifying source configuration."""
     if mode not in MENU_BAR_MODES:
         raise ValueError(f"未知的菜单栏显示模式：{mode}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps({"menu_bar_mode": mode}, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
-    path.chmod(0o600)
+    _write_settings(path, {"menu_bar_mode": mode})
+
+
+def save_low_usage_alert_config(path: Path, alert: LowUsageAlertConfig) -> None:
+    """Persist alert preferences while preserving unrelated local settings."""
+    _write_settings(path, {"low_usage_alert": alert.as_dict()})
 
 
 def _refresh_installed_plugin() -> None:
@@ -295,6 +404,134 @@ def write_cache(path: Path, metrics: dict[str, Any], collected_at: float) -> Non
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps({"metrics": metrics, "collected_at": collected_at}, ensure_ascii=False), encoding="utf-8")
     temporary.replace(path)
+
+
+def _read_alert_state(path: Path) -> dict[str, Any]:
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _write_alert_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+    path.chmod(0o600)
+
+
+def _low_usage_measurement(metrics: dict[str, Any]) -> tuple[float, float] | None:
+    """Return the maximum per-GPU work and VRAM use, or None when unknown.
+
+    A workload may run on any available GPU, so every GPU must be below both
+    thresholds.  Using the highest per-GPU VRAM percentage avoids a busy GPU
+    being masked by another GPU with little allocated memory.
+    """
+    gpus = metrics.get("gpus") or []
+    if not gpus:
+        return None
+    gpu_utilizations = [_number(gpu.get("utilization_gpu")) for gpu in gpus]
+    memory_used = [_number(gpu.get("memory_used")) for gpu in gpus]
+    memory_total = [_number(gpu.get("memory_total")) for gpu in gpus]
+    if (any(value is None for value in gpu_utilizations) or any(value is None for value in memory_used)
+            or any(value is None or value <= 0 for value in memory_total)):
+        return None
+    vram_utilizations = [used / total * 100 for used, total in zip(memory_used, memory_total)]
+    return max(gpu_utilizations), max(vram_utilizations)
+
+
+def _alert_config_signature(alert: LowUsageAlertConfig) -> dict[str, Any]:
+    """Changing a rule starts a fresh observation period to avoid false alerts."""
+    return alert.as_dict()
+
+
+def update_low_usage_alert(path: Path, alert: LowUsageAlertConfig,
+                           metrics: dict[str, Any], collected_at: float) -> tuple[LowUsageAlertStatus, bool]:
+    """Advance the persisted detector and return whether a notification is due.
+
+    Only successful, complete GPU samples participate.  Cached or missing GPU
+    readings therefore cannot start or extend the low-usage timer.
+    """
+    measurement = _low_usage_measurement(metrics)
+    if not alert.enabled:
+        # Clear a prior run once so toggling the feature off and back on starts
+        # a fresh observation window, while avoiding writes for a new default
+        # installation where alerts have never been enabled.
+        if _read_alert_state(path):
+            _write_alert_state(path, {})
+        return LowUsageAlertStatus(), False
+
+    state = _read_alert_state(path)
+    signature = _alert_config_signature(alert)
+    if state.get("config") != signature:
+        state = {"config": signature, "low_since": None, "notified": False}
+
+    if measurement is None:
+        state.update({"low_since": None, "notified": False})
+        _write_alert_state(path, state)
+        return LowUsageAlertStatus(monitoring=True), False
+
+    max_gpu_utilization, vram_utilization = measurement
+    is_low = (max_gpu_utilization <= alert.gpu_utilization_threshold
+              and vram_utilization <= alert.vram_utilization_threshold)
+    if not is_low:
+        state.update({"low_since": None, "notified": False})
+        _write_alert_state(path, state)
+        return LowUsageAlertStatus(
+            monitoring=True,
+            max_gpu_utilization=max_gpu_utilization,
+            vram_utilization=vram_utilization,
+        ), False
+
+    low_since = _number(state.get("low_since"))
+    if low_since is None or low_since > collected_at:
+        low_since = collected_at
+        state.update({"low_since": low_since, "notified": False})
+    notified = _as_bool(state.get("notified"), False)
+    should_notify = not notified and collected_at - low_since >= alert.duration_seconds
+    _write_alert_state(path, state)
+    return LowUsageAlertStatus(
+        monitoring=True,
+        low_since=low_since,
+        notified=notified,
+        max_gpu_utilization=max_gpu_utilization,
+        vram_utilization=vram_utilization,
+    ), should_notify
+
+
+def mark_low_usage_alert_notified(path: Path, alert: LowUsageAlertConfig) -> None:
+    """Record delivery only after macOS has accepted the notification."""
+    state = _read_alert_state(path)
+    if state.get("config") == _alert_config_signature(alert):
+        state["notified"] = True
+        _write_alert_state(path, state)
+
+
+def send_low_usage_notification(hostname: str, alert: LowUsageAlertConfig,
+                                status: LowUsageAlertStatus) -> None:
+    """Display one native macOS notification without introducing dependencies."""
+    host = hostname or "Windows PC"
+    gpu = status.max_gpu_utilization
+    vram = status.vram_utilization
+    message = (
+        f"{host} 的 GPU 利用率为 {gpu:.0f}%（阈值 {alert.gpu_utilization_threshold:g}%），"
+        f"最高显存占用为 {vram:.0f}%（阈值 {alert.vram_utilization_threshold:g}%），"
+        f"已持续 {_fmt_duration(alert.duration_seconds)}。"
+    )
+    script = (
+        f"display notification {json.dumps(message, ensure_ascii=False)} "
+        f"with title {json.dumps('WinBarMonitor：任务可能已完成', ensure_ascii=False)}"
+    )
+    try:
+        completed = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True,
+                                   text=True, errors="replace", timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"无法发送 macOS 通知：{exc}") from None
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip().splitlines()
+        raise RuntimeError(detail[-1] if detail else "无法发送 macOS 通知")
 
 
 HISTORY_COLUMNS = (
@@ -627,6 +864,82 @@ def _display_settings_menu(settings_path: Path, current_mode: str) -> list[str]:
     ]]
 
 
+def _settings_action(command: str, settings_path: Path, *arguments: str) -> str:
+    script = json.dumps(str(Path(__file__).resolve()), ensure_ascii=False)
+    settings = json.dumps(str(settings_path), ensure_ascii=False)
+    parameters = ["bash=/usr/bin/env", "param1=python3", f"param2={script}", f"param3={command}"]
+    parameters.extend(f"param{index}={argument}" for index, argument in enumerate(arguments, start=4))
+    settings_index = len(parameters) + 1
+    parameters.extend([f"param{settings_index}=--settings-path", f"param{settings_index + 1}={settings}",
+                       "terminal=false", "refresh=true"])
+    return " | " + " ".join(parameters)
+
+
+def _fmt_duration(seconds: int) -> str:
+    if seconds % 60 == 0:
+        return f"{seconds // 60} 分钟"
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes, remainder = divmod(seconds, 60)
+    return f"{minutes} 分钟 {remainder} 秒"
+
+
+def _set_low_usage_alert_action(alert: LowUsageAlertConfig, settings_path: Path) -> str:
+    return _settings_action(
+        "--set-low-usage-alert", settings_path,
+        "true" if alert.enabled else "false",
+        f"{alert.gpu_utilization_threshold:g}",
+        f"{alert.vram_utilization_threshold:g}",
+        str(alert.duration_seconds),
+    )
+
+
+ALERT_PRESETS = (
+    ("GPU ≤ 10% · 显存 ≤ 10% · 20 分钟", 10, 10, 20 * 60),
+    ("GPU ≤ 5% · 显存 ≤ 5% · 10 分钟", 5, 5, 10 * 60),
+    ("GPU ≤ 5% · 显存 ≤ 10% · 5 分钟", 5, 10, 5 * 60),
+    ("GPU ≤ 2% · 显存 ≤ 5% · 2 分钟", 2, 5, 2 * 60),
+)
+
+
+def _low_usage_alert_menu(alert: LowUsageAlertConfig, status: LowUsageAlertStatus,
+                          settings_path: Path, collected_at: float | None) -> list[str]:
+    threshold_text = (f"GPU ≤ {alert.gpu_utilization_threshold:g}% · "
+                      f"显存 ≤ {alert.vram_utilization_threshold:g}% · {_fmt_duration(alert.duration_seconds)}")
+    # Keep this hierarchy and every child count stable across refreshes.  Recent
+    # SwiftBar versions can leave a reused parent submenu disabled when its
+    # child count changes after an action (for example, enable -> disable).
+    if not alert.enabled:
+        status_text = "未启用"
+        action_label = "--启用当前规则"
+    elif status.notified:
+        status_text = "已提醒 · GPU 再次繁忙后将重新布防"
+        action_label = "--关闭提醒"
+    elif status.low_since is not None:
+        reference = collected_at if collected_at is not None else time.time()
+        elapsed = max(0, int(reference - status.low_since))
+        status_text = f"低占用计时中 · {_fmt_duration(elapsed)} / {_fmt_duration(alert.duration_seconds)}"
+        action_label = "--关闭提醒"
+    elif status.max_gpu_utilization is not None and status.vram_utilization is not None:
+        status_text = f"监测中 · GPU {status.max_gpu_utilization:.0f}% · 显存 {status.vram_utilization:.0f}%"
+        action_label = "--关闭提醒"
+    else:
+        status_text = "监测中 · 等待完整 GPU 数据"
+        action_label = "--关闭提醒"
+    lines = ["⏰ 任务完成提醒", f"--状态 · {status_text}", f"--当前规则 · {threshold_text}"]
+    lines.append(action_label + _set_low_usage_alert_action(replace(alert, enabled=not alert.enabled), settings_path))
+    lines.extend([
+        "--快速预设",
+        *[
+            "----" + label + _set_low_usage_alert_action(
+                LowUsageAlertConfig(True, gpu, vram, duration), settings_path)
+            for label, gpu, vram, duration in ALERT_PRESETS
+        ],
+        "--输入自定义规则并启用…" + _settings_action("--configure-low-usage-alert", settings_path),
+    ])
+    return lines
+
+
 def _details_action(label: str, report_path: Path) -> str:
     """Make a read-only metric a high-contrast, meaningful SwiftBar menu item."""
     quoted_path = json.dumps(str(report_path), ensure_ascii=False)
@@ -656,7 +969,9 @@ def _uptime(last_boot: Any, now: float | None = None) -> str:
 def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = None,
            collected_at: float | None = None, report_path: Path = DEFAULT_REPORT_PATH,
            ssh_alias: str | None = None, plugin_name: str = "winbar.1m.py",
-           menu_bar_mode: str = "auto", settings_path: Path = DEFAULT_SETTINGS_PATH) -> str:
+           menu_bar_mode: str = "auto", settings_path: Path = DEFAULT_SETTINGS_PATH,
+           low_usage_alert: LowUsageAlertConfig = LowUsageAlertConfig(),
+           low_usage_alert_status: LowUsageAlertStatus = LowUsageAlertStatus()) -> str:
     gpu = (metrics.get("gpus") or [{}])[0]
     cpu = _percent(metrics.get("cpu_percent"))
     gpu_util = _percent(gpu.get("utilization_gpu"))
@@ -698,7 +1013,8 @@ def render(metrics: dict[str, Any], *, stale: bool = False, error: str | None = 
     if collected_at:
         timestamp = datetime.fromtimestamp(collected_at).astimezone().strftime("%Y-%m-%d %H:%M:%S")
         lines.append(f"---\n{detail(f'🕒 {timestamp}')}")
-    lines.extend(["---", *_display_settings_menu(settings_path, menu_bar_mode), "---", _history_action(report_path), "🔄 手动刷新 | refresh=true",
+    lines.extend(["---", *_low_usage_alert_menu(low_usage_alert, low_usage_alert_status, settings_path, collected_at),
+                  "---", *_display_settings_menu(settings_path, menu_bar_mode), "---", _history_action(report_path), "🔄 手动刷新 | refresh=true",
                   f"🔐 打开 SSH | bash=/usr/bin/ssh param1={alias} terminal=true"])
     return "\n".join(lines)
 
@@ -716,39 +1032,148 @@ def main() -> int:
             write_history_report(config.history_path, config.report_path, collected_at, metrics)
         except (OSError, ValueError, sqlite3.Error) as exc:
             history_error = f"历史记录失败：{exc}"
-        print(render(metrics, error=history_error, collected_at=collected_at,
+        alert_status = LowUsageAlertStatus()
+        alert_error = None
+        try:
+            alert_status, should_notify = update_low_usage_alert(
+                config.alert_state_path, config.low_usage_alert, metrics, collected_at)
+            if should_notify:
+                send_low_usage_notification(
+                    str(metrics.get("hostname") or config.ssh_alias), config.low_usage_alert, alert_status)
+                mark_low_usage_alert_notified(config.alert_state_path, config.low_usage_alert)
+                alert_status = replace(alert_status, notified=True)
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            alert_error = f"提醒失败：{exc}"
+        errors = [error for error in (history_error, alert_error) if error]
+        print(render(metrics, error=" · ".join(errors) or None, collected_at=collected_at,
                      report_path=config.report_path, ssh_alias=config.ssh_alias,
-                     menu_bar_mode=config.menu_bar_mode, settings_path=config.settings_path))
+                     menu_bar_mode=config.menu_bar_mode, settings_path=config.settings_path,
+                     low_usage_alert=config.low_usage_alert, low_usage_alert_status=alert_status))
     except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
         if cached:
             print(render(normalize_metrics(cached), stale=True, error=f"连接失败：{exc}",
                          collected_at=cached_at, report_path=config.report_path,
                          ssh_alias=config.ssh_alias, menu_bar_mode=config.menu_bar_mode,
-                         settings_path=config.settings_path))
+                         settings_path=config.settings_path, low_usage_alert=config.low_usage_alert))
         else:
             print(f"{_menu_icon('red')}\n---\n🔴 离线 · Windows\n---\n⚠️ {exc}\n---\n"
-                  f"{_history_action(config.report_path)}\n🔄 手动刷新 | refresh=true")
+                  + "\n".join(_low_usage_alert_menu(config.low_usage_alert, LowUsageAlertStatus(),
+                                                       config.settings_path, None))
+                  + f"\n---\n{_history_action(config.report_path)}\n🔄 手动刷新 | refresh=true")
     return 0
 
 
+def _prompt_with_osascript(prompt: str, default: str) -> str | None:
+    """Show one native input dialog; cancelling leaves preferences untouched."""
+    dialog = (
+        f"display dialog {json.dumps(prompt, ensure_ascii=False)} "
+        f"default answer {json.dumps(default, ensure_ascii=False)} "
+        'buttons {"取消", "保存并启用"} default button "保存并启用" cancel button "取消" '
+        'with title "WinBarMonitor 自定义任务完成提醒"'
+    )
+    try:
+        completed = subprocess.run(["/usr/bin/osascript", "-e", f"text returned of ({dialog})"],
+                                   capture_output=True, text=True, errors="replace", timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"无法打开设置窗口：{exc}") from None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def _prompt_low_usage_alert_config(current: LowUsageAlertConfig) -> LowUsageAlertConfig | None:
+    """Collect every custom value in one compact, parseable macOS dialog."""
+    value = _prompt_with_osascript(
+        "输入：GPU 阈值 %, 显存阈值 %, 持续时间（分钟）\n例如：5, 5, 10",
+        f"{current.gpu_utilization_threshold:g}, {current.vram_utilization_threshold:g}, "
+        f"{current.duration_seconds / 60:g}",
+    )
+    if value is None:
+        return None
+    fields = [field.strip() for field in re.split(r"[,，]", value)]
+    if len(fields) != 3 or any(not field for field in fields):
+        raise ValueError("请按“GPU 阈值, 显存阈值, 持续分钟”格式输入，例如：5, 5, 10")
+    gpu = _number(fields[0].rstrip("% "))
+    vram = _number(fields[1].rstrip("% "))
+    duration_minutes = _number(fields[2])
+    if gpu is None or not 0 <= gpu <= 100:
+        raise ValueError("GPU 利用率阈值必须是 0 到 100 之间的数字")
+    if vram is None or not 0 <= vram <= 100:
+        raise ValueError("显存占用阈值必须是 0 到 100 之间的数字")
+    if duration_minutes is None or duration_minutes <= 0:
+        raise ValueError("持续时间必须是大于 0 的分钟数")
+    return LowUsageAlertConfig(
+        enabled=True,
+        gpu_utilization_threshold=gpu,
+        vram_utilization_threshold=vram,
+        duration_seconds=max(1, round(duration_minutes * 60)),
+    )
+
+
+def _settings_path_from_arguments(arguments: list[str], start: int) -> Path:
+    if len(arguments) == start:
+        return DEFAULT_SETTINGS_PATH
+    if len(arguments) == start + 2 and arguments[start] == "--settings-path":
+        return Path(arguments[start + 1]).expanduser()
+    raise ValueError("设置路径参数无效")
+
+
+def _low_usage_alert_from_cli(values: list[str]) -> LowUsageAlertConfig:
+    if len(values) != 4 or values[0].lower() not in ("true", "false"):
+        raise ValueError("提醒设置格式无效")
+    gpu = _number(values[1])
+    vram = _number(values[2])
+    duration = _number(values[3])
+    if gpu is None or not 0 <= gpu <= 100:
+        raise ValueError("GPU 利用率阈值必须是 0 到 100 之间的数字")
+    if vram is None or not 0 <= vram <= 100:
+        raise ValueError("显存占用阈值必须是 0 到 100 之间的数字")
+    if duration is None or duration < 60:
+        raise ValueError("持续时间至少为 1 分钟")
+    return LowUsageAlertConfig(
+        enabled=values[0].lower() == "true",
+        gpu_utilization_threshold=gpu,
+        vram_utilization_threshold=vram,
+        duration_seconds=round(duration),
+    )
+
+
 def cli_main(arguments: list[str]) -> int:
-    """Handle the small, local-only settings command used by the SwiftBar menu."""
+    """Handle local-only SwiftBar settings commands."""
     if not arguments:
         return main()
-    if arguments[0] != "--set-menu-bar-mode" or len(arguments) not in (2, 4):
-        print("用法：--set-menu-bar-mode <模式> [--settings-path <路径>]", file=sys.stderr)
-        return 2
-    mode = arguments[1]
-    settings_path = DEFAULT_SETTINGS_PATH
-    if len(arguments) == 4:
-        if arguments[2] != "--settings-path":
-            print("用法：--set-menu-bar-mode <模式> [--settings-path <路径>]", file=sys.stderr)
-            return 2
-        settings_path = Path(arguments[3]).expanduser()
     try:
-        save_menu_bar_mode(settings_path, mode)
+        command = arguments[0]
+        if command == "--set-menu-bar-mode":
+            if len(arguments) not in (2, 4):
+                raise ValueError("用法：--set-menu-bar-mode <模式> [--settings-path <路径>]")
+            save_menu_bar_mode(_settings_path_from_arguments(arguments, 2), arguments[1])
+        elif command == "--set-low-usage-alert":
+            if len(arguments) not in (5, 7):
+                raise ValueError("用法：--set-low-usage-alert <true|false> <GPU%> <显存%> <秒> [--settings-path <路径>]")
+            settings_path = _settings_path_from_arguments(arguments, 5)
+            save_low_usage_alert_config(settings_path, _low_usage_alert_from_cli(arguments[1:5]))
+        elif command == "--set-low-usage-alert-enabled":
+            if len(arguments) not in (2, 4):
+                raise ValueError("用法：--set-low-usage-alert-enabled <true|false> [--settings-path <路径>]")
+            enabled_text = arguments[1].strip().lower()
+            if enabled_text not in ("true", "false"):
+                raise ValueError("提醒开关只能是 true 或 false")
+            settings_path = _settings_path_from_arguments(arguments, 2)
+            current = _low_usage_alert_config(_read_settings(settings_path).get("low_usage_alert"))
+            save_low_usage_alert_config(settings_path, replace(current, enabled=enabled_text == "true"))
+        elif command == "--configure-low-usage-alert":
+            settings_path = _settings_path_from_arguments(arguments, 1)
+            current = _low_usage_alert_config(_read_settings(settings_path).get("low_usage_alert"))
+            updated = _prompt_low_usage_alert_config(current)
+            if updated is None:
+                return 0
+            save_low_usage_alert_config(settings_path, updated)
+        else:
+            raise ValueError("用法：--set-menu-bar-mode <模式> [--settings-path <路径>]；"
+                             "--configure-low-usage-alert [--settings-path <路径>]")
         _refresh_installed_plugin()
-    except (OSError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         print(f"保存设置失败：{exc}", file=sys.stderr)
         return 1
     return 0
