@@ -508,6 +508,13 @@ class RuntimeCompatibilityTests(unittest.TestCase):
         self.assertIn("File]::Replace($temporary, $Path, $backup, $true)", collector)
         self.assertNotIn("File]::Replace($temporary, $Path, $null, $true)", collector)
 
+    def test_windows_installer_delimits_account_before_a_colon(self):
+        project_root = Path(__file__).resolve().parents[1]
+        installer = (project_root / "windows" / "install-windows-collector.ps1").read_text(
+            encoding="ascii")
+        self.assertIn("${ReaderAccount}: $($_.Exception.Message)", installer)
+        self.assertNotIn("$ReaderAccount: $($_.Exception.Message)", installer)
+
     def test_plugin_does_not_refresh_on_open(self):
         project_root = Path(__file__).resolve().parents[1]
         plugin = (project_root / "winbar.1m.py").read_text(encoding="utf-8")

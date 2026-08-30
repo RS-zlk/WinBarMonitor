@@ -46,7 +46,7 @@ if ($ReaderAccount) {
             throw "icacls returned exit code $LASTEXITCODE"
         }
     } catch {
-        throw "Cannot grant read-only access to $ReaderAccount: $($_.Exception.Message)"
+        throw "Cannot grant read-only access to ${ReaderAccount}: $($_.Exception.Message)"
     }
 }
 
