@@ -38,3 +38,32 @@ jobs:
         run: /usr/bin/python3 -m py_compile winbar_monitor.py winbar.1m.py
       - name: Check shell syntax
         run: sh -n install.sh uninstall.sh
+
+  windows-collector:
+    name: Windows PowerShell collector
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse Windows scripts
+        shell: powershell
+        run: |
+          $errors = @()
+          Get-ChildItem windows -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            $errors += $parseErrors
+          }
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }
+      - name: Run one local collection
+        shell: powershell
+        run: |
+          $dataDirectory = Join-Path $env:RUNNER_TEMP 'winbar-monitor'
+          & .\windows\collect-winbar.ps1 -DataDirectory $dataDirectory -RetentionDays 1
+          if (-not (Test-Path (Join-Path $dataDirectory 'latest.json'))) {
+            throw 'Collector did not create latest.json.'
+          }

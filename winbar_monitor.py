@@ -28,6 +28,9 @@ from typing import Any
 
 DEFAULT_REFRESH_SECONDS = 30
 DEFAULT_SSH_TIMEOUT = 15
+DEFAULT_DATA_SOURCE = "direct-ssh"
+DEFAULT_REMOTE_DATA_DIR = r"C:\ProgramData\WinBarMonitor"
+DEFAULT_WINDOWS_SAMPLE_SECONDS = 30
 DEFAULT_CACHE_PATH = Path.home() / ".cache" / "winbar-monitor" / "cache.json"
 DEFAULT_HISTORY_PATH = Path.home() / ".local" / "share" / "winbar-monitor" / "history.sqlite3"
 DEFAULT_REPORT_PATH = Path.home() / ".local" / "share" / "winbar-monitor" / "history.html"
@@ -124,6 +127,9 @@ class Config:
     ssh_alias: str = "windows-monitor"
     refresh_seconds: int = DEFAULT_REFRESH_SECONDS
     ssh_timeout: int = DEFAULT_SSH_TIMEOUT
+    data_source: str = DEFAULT_DATA_SOURCE
+    remote_data_dir: str = DEFAULT_REMOTE_DATA_DIR
+    windows_sample_seconds: int = DEFAULT_WINDOWS_SAMPLE_SECONDS
     cache_path: Path = DEFAULT_CACHE_PATH
     history_path: Path = DEFAULT_HISTORY_PATH
     report_path: Path = DEFAULT_REPORT_PATH
@@ -175,6 +181,11 @@ class Config:
             ssh_alias=str(value("WINBAR_SSH_ALIAS", cls.ssh_alias)),
             refresh_seconds=positive_int("WINBAR_REFRESH_SECONDS", DEFAULT_REFRESH_SECONDS),
             ssh_timeout=positive_int("WINBAR_SSH_TIMEOUT", DEFAULT_SSH_TIMEOUT),
+            data_source=str(value("WINBAR_DATA_SOURCE", DEFAULT_DATA_SOURCE)).strip().lower(),
+            remote_data_dir=str(value("WINBAR_REMOTE_DATA_DIR", DEFAULT_REMOTE_DATA_DIR)).strip()
+            or DEFAULT_REMOTE_DATA_DIR,
+            windows_sample_seconds=positive_int(
+                "WINBAR_WINDOWS_SAMPLE_SECONDS", DEFAULT_WINDOWS_SAMPLE_SECONDS),
             cache_path=Path(cache_path).expanduser() if cache_path else DEFAULT_CACHE_PATH,
             history_path=Path(history_path).expanduser() if history_path else DEFAULT_HISTORY_PATH,
             report_path=Path(report_path).expanduser() if report_path else DEFAULT_REPORT_PATH,
@@ -372,8 +383,9 @@ def normalize_metrics(raw: dict[str, Any]) -> dict[str, Any]:
     return metrics
 
 
-def collect_remote(config: Config) -> dict[str, Any]:
-    encoded = base64.b64encode(POWERSHELL_SCRIPT.encode("utf-16le")).decode("ascii")
+def _run_remote_powershell(config: Config, script: str) -> str:
+    """Run a read-only PowerShell script through the configured SSH alias."""
+    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
     command = [
         "ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={min(config.ssh_timeout, 5)}",
         "-o", "ControlMaster=auto", "-o", "ControlPersist=60",
@@ -388,7 +400,98 @@ def collect_remote(config: Config) -> dict[str, Any]:
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip().splitlines()
         raise RuntimeError(detail[-1] if detail else f"ssh 返回码 {completed.returncode}")
-    return normalize_metrics(_first_json_object(completed.stdout))
+    return completed.stdout
+
+
+def collect_remote(config: Config) -> dict[str, Any]:
+    """Collect a live sample on Windows for the legacy direct-SSH mode."""
+    return normalize_metrics(_first_json_object(_run_remote_powershell(config, POWERSHELL_SCRIPT)))
+
+
+def _powershell_read_file_script(path: str) -> str:
+    """Build a path-safe script that only reads one UTF-8 record file."""
+    encoded_path = base64.b64encode(path.encode("utf-8")).decode("ascii")
+    return f'''$ErrorActionPreference = 'Stop'
+$path = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_path}'))
+if (-not [System.IO.File]::Exists($path)) {{ throw "监控记录不存在：$path" }}
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8
+[Console]::Write([System.IO.File]::ReadAllText($path, $utf8))
+'''
+
+
+def collect_windows_file(config: Config) -> tuple[dict[str, Any], float]:
+    """Read the current sample written locally by the Windows collector."""
+    latest_path = str(Path(config.remote_data_dir) / "latest.json").replace("/", "\\")
+    payload = _run_remote_powershell(config, _powershell_read_file_script(latest_path))
+    try:
+        snapshot = json.loads(payload.lstrip("\ufeff"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Windows 最新监控记录不是有效 JSON") from exc
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("metrics"), dict):
+        raise RuntimeError("Windows 最新监控记录格式无效")
+    collected_at = _number(snapshot.get("collected_at"))
+    if collected_at is None or collected_at <= 0:
+        raise RuntimeError("Windows 最新监控记录缺少采集时间")
+    return normalize_metrics(snapshot["metrics"]), collected_at
+
+
+def _powershell_read_history_script(directory: str, since: float) -> str:
+    """Build a read-only, timestamp-filtered history export command.
+
+    Files are named by UTC day, so only days that could contain newer samples
+    are opened.  This keeps normal reconnect backfills small even after the
+    collector has been running for months.
+    """
+    encoded_directory = base64.b64encode(directory.encode("utf-8")).decode("ascii")
+    return f'''$ErrorActionPreference = 'Stop'
+$directory = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_directory}'))
+$since = [double]{since:.6f}
+if (-not [System.IO.Directory]::Exists($directory)) {{ throw "监控历史目录不存在：$directory" }}
+$startName = [System.DateTimeOffset]::FromUnixTimeSeconds([Int64][Math]::Floor($since)).UtcDateTime.ToString('yyyy-MM-dd')
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8
+Get-ChildItem -LiteralPath $directory -Filter '*.jsonl' -File |
+  Where-Object {{ $_.BaseName -ge $startName }} |
+  Sort-Object -Property Name |
+  ForEach-Object {{
+    foreach ($line in [System.IO.File]::ReadLines($_.FullName, $utf8)) {{
+      if ([string]::IsNullOrWhiteSpace($line)) {{ continue }}
+      try {{
+        $record = $line | ConvertFrom-Json
+        if ($record.schema_version -eq 1 -and [double]$record.collected_at -gt $since) {{
+          [Console]::WriteLine($line)
+        }}
+      }} catch {{}}
+    }}
+  }}
+'''
+
+
+def read_windows_history(config: Config, since: float) -> list[tuple[dict[str, Any], float]]:
+    """Read buffered Windows samples newer than ``since`` without recollecting."""
+    directory = str(Path(config.remote_data_dir) / "history").replace("/", "\\")
+    output = _run_remote_powershell(config, _powershell_read_history_script(directory, since))
+    samples: list[tuple[dict[str, Any], float]] = []
+    for line in output.splitlines():
+        try:
+            record = json.loads(line.lstrip("\ufeff"))
+            metrics = record.get("metrics") if isinstance(record, dict) else None
+            collected_at = _number(record.get("collected_at")) if isinstance(record, dict) else None
+        except (TypeError, ValueError):
+            continue
+        if isinstance(metrics, dict) and collected_at is not None and collected_at > since:
+            samples.append((normalize_metrics(metrics), collected_at))
+    return sorted(samples, key=lambda sample: sample[1])
+
+
+def collect(config: Config) -> tuple[dict[str, Any], float]:
+    """Return one sample from the selected collection source."""
+    if config.data_source == "windows-files":
+        return collect_windows_file(config)
+    if config.data_source == "direct-ssh":
+        return collect_remote(config), time.time()
+    raise ValueError("WINBAR_DATA_SOURCE 必须是 direct-ssh 或 windows-files")
 
 
 def read_cache(path: Path) -> tuple[dict[str, Any] | None, float | None]:
@@ -509,6 +612,12 @@ def mark_low_usage_alert_notified(path: Path, alert: LowUsageAlertConfig) -> Non
         _write_alert_state(path, state)
 
 
+def reset_low_usage_alert(path: Path) -> None:
+    """Clear an observation window after a monitoring gap."""
+    if _read_alert_state(path):
+        _write_alert_state(path, {})
+
+
 def send_low_usage_notification(hostname: str, alert: LowUsageAlertConfig,
                                 status: LowUsageAlertStatus) -> None:
     """Display one native macOS notification without introducing dependencies."""
@@ -598,6 +707,43 @@ def record_history(path: Path, metrics: dict[str, Any], collected_at: float,
                 (collected_at,) + _history_values(metrics),
             )
             database.execute("DELETE FROM samples WHERE collected_at < ?", (collected_at - retention_days * 86400,))
+
+
+def latest_history_timestamp(path: Path) -> float | None:
+    """Return the newest local sample time, if the history database exists."""
+    try:
+        with closing(sqlite3.connect(str(path), timeout=5)) as database:
+            row = database.execute("SELECT MAX(collected_at) FROM samples").fetchone()
+    except sqlite3.Error:
+        return None
+    return _number(row[0]) if row else None
+
+
+def windows_history_has_gap(config: Config, collected_at: float) -> bool:
+    """Whether a Windows-recorded interval is missing from local history."""
+    latest_local = latest_history_timestamp(config.history_path)
+    return latest_local is None or collected_at - latest_local > config.windows_sample_seconds * 1.5
+
+
+def record_windows_history(config: Config, metrics: dict[str, Any], collected_at: float) -> bool:
+    """Backfill a gap from Windows files before recording the current sample.
+
+    During normal operation SwiftBar receives the current snapshot every
+    refresh, so it writes directly to local history without reading the daily
+    files.  A gap of more than one and a half Windows sample intervals means
+    the Mac was asleep or disconnected; only then are buffered samples fetched.
+    """
+    latest_local = latest_history_timestamp(config.history_path)
+    gap = latest_local is None or collected_at - latest_local > config.windows_sample_seconds * 1.5
+    if gap:
+        since = latest_local if latest_local is not None else (
+            collected_at - config.retention_days * 86400)
+        for historical_metrics, historical_at in read_windows_history(config, max(0, since)):
+            if historical_at <= collected_at:
+                record_history(config.history_path, historical_metrics, historical_at,
+                               config.retention_days)
+    record_history(config.history_path, metrics, collected_at, config.retention_days)
+    return gap
 
 
 def _query_report_range(database: sqlite3.Connection, now: float, seconds: int,
@@ -1023,18 +1169,24 @@ def main() -> int:
     config = Config.from_env()
     cached, cached_at = read_cache(config.cache_path)
     try:
-        metrics = collect_remote(config)
-        collected_at = time.time()
+        metrics, collected_at = collect(config)
         write_cache(config.cache_path, metrics, collected_at)
         history_error = None
+        history_gap = False
         try:
-            record_history(config.history_path, metrics, collected_at, config.retention_days)
+            if config.data_source == "windows-files":
+                history_gap = windows_history_has_gap(config, collected_at)
+                history_gap = record_windows_history(config, metrics, collected_at)
+            else:
+                record_history(config.history_path, metrics, collected_at, config.retention_days)
             write_history_report(config.history_path, config.report_path, collected_at, metrics)
-        except (OSError, ValueError, sqlite3.Error) as exc:
+        except (OSError, RuntimeError, ValueError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
             history_error = f"历史记录失败：{exc}"
         alert_status = LowUsageAlertStatus()
         alert_error = None
         try:
+            if history_gap:
+                reset_low_usage_alert(config.alert_state_path)
             alert_status, should_notify = update_low_usage_alert(
                 config.alert_state_path, config.low_usage_alert, metrics, collected_at)
             if should_notify:

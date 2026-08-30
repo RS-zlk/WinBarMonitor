@@ -151,6 +151,17 @@ class CacheAndTimeoutTests(unittest.TestCase):
         self.assertEqual(config.ssh_timeout, 1)
         self.assertEqual(config.ssh_alias, "custom-host")
 
+    def test_windows_file_source_configuration_is_loaded(self):
+        with patch.dict(os.environ, {
+            "WINBAR_DATA_SOURCE": "windows-files",
+            "WINBAR_REMOTE_DATA_DIR": r"D:\Monitoring Data",
+            "WINBAR_WINDOWS_SAMPLE_SECONDS": "30",
+        }, clear=False):
+            config = wm.Config.from_env()
+        self.assertEqual(config.data_source, "windows-files")
+        self.assertEqual(config.remote_data_dir, r"D:\Monitoring Data")
+        self.assertEqual(config.windows_sample_seconds, 30)
+
     def test_timeout_uses_cache(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "cache.json"
@@ -169,6 +180,73 @@ class CacheAndTimeoutTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, r"SSH/PowerShell 采集超时（1 秒）"):
                 wm.collect_remote(wm.Config(ssh_timeout=1))
+
+    def test_windows_file_snapshot_is_normalized_with_source_timestamp(self):
+        payload = json.dumps({
+            "schema_version": 1,
+            "collected_at": 1_700_000_000.5,
+            "metrics": {"hostname": "LAPTOP", "cpu_percent": "31", "gpus": []},
+        })
+        config = wm.Config(data_source="windows-files", remote_data_dir=r"C:\ProgramData\WinBarMonitor")
+        with patch("winbar_monitor._run_remote_powershell", return_value=payload) as runner:
+            metrics, collected_at = wm.collect_windows_file(config)
+        self.assertEqual(metrics["hostname"], "LAPTOP")
+        self.assertEqual(metrics["cpu_percent"], 31)
+        self.assertEqual(collected_at, 1_700_000_000.5)
+        self.assertIn("ReadAllText", runner.call_args.args[1])
+        self.assertNotIn("Get-CimInstance", runner.call_args.args[1])
+
+    def test_windows_history_skips_invalid_lines_and_orders_samples(self):
+        older = json.dumps({"schema_version": 1, "collected_at": 100,
+                             "metrics": {"hostname": "PC", "cpu_percent": 1}})
+        newer = json.dumps({"schema_version": 1, "collected_at": 200,
+                             "metrics": {"hostname": "PC", "cpu_percent": 2}})
+        config = wm.Config(data_source="windows-files")
+        with patch("winbar_monitor._run_remote_powershell", return_value=f"not-json\n{newer}\n{older}\n"):
+            samples = wm.read_windows_history(config, 50)
+        self.assertEqual([(sample[0]["cpu_percent"], sample[1]) for sample in samples], [(1, 100), (2, 200)])
+
+    def test_windows_history_gap_is_backfilled_before_current_sample(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = wm.Config(
+                data_source="windows-files",
+                history_path=Path(folder) / "history.sqlite3",
+                retention_days=30,
+                windows_sample_seconds=30,
+            )
+            metrics = wm.normalize_metrics({"hostname": "PC", "cpu_percent": 20, "gpus": []})
+            buffered = [
+                (wm.normalize_metrics({"hostname": "PC", "cpu_percent": 10, "gpus": []}), 100),
+                (wm.normalize_metrics({"hostname": "PC", "cpu_percent": 15, "gpus": []}), 130),
+            ]
+            with patch("winbar_monitor.read_windows_history", return_value=buffered) as reader:
+                wm.record_windows_history(config, metrics, 160)
+            self.assertTrue(reader.called)
+            with closing(sqlite3.connect(config.history_path)) as database:
+                values = database.execute("SELECT collected_at FROM samples ORDER BY collected_at").fetchall()
+            self.assertEqual(values, [(100.0,), (130.0,), (160.0,)])
+
+            with patch("winbar_monitor.read_windows_history") as reader:
+                wm.record_windows_history(config, metrics, 190)
+            reader.assert_not_called()
+
+    def test_windows_history_backfill_error_keeps_current_snapshot_visible(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config = wm.Config(
+                data_source="windows-files",
+                cache_path=root / "cache.json",
+                history_path=root / "history.sqlite3",
+                report_path=root / "history.html",
+            )
+            metrics = wm.normalize_metrics({"hostname": "PC", "cpu_percent": 20, "gpus": []})
+            with patch.object(wm.Config, "from_env", return_value=config):
+                with patch("winbar_monitor.collect_windows_file", return_value=(metrics, 1_000)):
+                    with patch("winbar_monitor.read_windows_history", side_effect=RuntimeError("history offline")):
+                        with patch("builtins.print") as printer:
+                            wm.main()
+            self.assertIn("🟢 在线", printer.call_args.args[0])
+            self.assertIn("历史记录失败：history offline", printer.call_args.args[0])
 
     def test_windows_seven_digit_boot_time(self):
         value = wm._uptime("2020-01-02T03:04:05.5000000+08:00")
@@ -258,8 +336,18 @@ class LowUsageAlertTests(unittest.TestCase):
             wm.update_low_usage_alert(state_path, enabled, self._metrics(), 1_000)
             wm.update_low_usage_alert(state_path, disabled, self._metrics(), 1_050)
             restarted, notify = wm.update_low_usage_alert(state_path, enabled, self._metrics(), 1_120)
-        self.assertFalse(notify)
+            self.assertFalse(notify)
         self.assertEqual(restarted.low_since, 1_120)
+
+    def test_reset_low_usage_alert_clears_a_reconnect_observation_window(self):
+        alert = wm.LowUsageAlertConfig(enabled=True, duration_seconds=120)
+        with tempfile.TemporaryDirectory() as folder:
+            state_path = Path(folder) / "alert-state.json"
+            wm.update_low_usage_alert(state_path, alert, self._metrics(), 1_000)
+            wm.reset_low_usage_alert(state_path)
+            restarted, notify = wm.update_low_usage_alert(state_path, alert, self._metrics(), 1_300)
+        self.assertFalse(notify)
+        self.assertEqual(restarted.low_since, 1_300)
 
     def test_alert_settings_preserve_menu_bar_setting_and_can_be_toggled(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -407,6 +495,19 @@ class HistoryTests(unittest.TestCase):
 
 
 class RuntimeCompatibilityTests(unittest.TestCase):
+    def test_windows_powershell_sources_are_ascii_for_windows_powershell_5(self):
+        project_root = Path(__file__).resolve().parents[1]
+        for script in (project_root / "windows").glob("*.ps1"):
+            with self.subTest(script=script.name):
+                self.assertTrue(script.read_bytes().isascii())
+
+    def test_windows_collector_uses_a_real_backup_path_for_atomic_replace(self):
+        project_root = Path(__file__).resolve().parents[1]
+        collector = (project_root / "windows" / "collect-winbar.ps1").read_text(
+            encoding="ascii")
+        self.assertIn("File]::Replace($temporary, $Path, $backup, $true)", collector)
+        self.assertNotIn("File]::Replace($temporary, $Path, $null, $true)", collector)
+
     def test_plugin_does_not_refresh_on_open(self):
         project_root = Path(__file__).resolve().parents[1]
         plugin = (project_root / "winbar.1m.py").read_text(encoding="utf-8")
